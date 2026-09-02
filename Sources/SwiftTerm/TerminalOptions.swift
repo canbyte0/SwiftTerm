@@ -61,6 +61,32 @@ public enum CursorStyle: CaseIterable {
     }
 }
 
+/// Policy controlling how U+FE0F (Variation Selector-16 / "emoji presentation
+/// selector") affects the column width of a preceding base character.
+///
+/// Some base characters (for example U+26A0 ⚠ or U+2764 ❤) have a Unicode default
+/// width of 1 but are widened to 2 columns when followed by VS16, to match the
+/// width an emoji-presentation glyph occupies. Several host shells and
+/// terminal multiplexers (notably macOS `zsh` using the system `wcwidth()`)
+/// instead report width 1 for these base characters and width 0 for VS16
+/// itself, so they never widen. When SwiftTerm and the shell disagree on the
+/// width, bracketed-paste redraws and command-line cursor motion diverge and
+/// the displayed line drifts (for example `echo '⚠️'` rendering as `eecho ...`).
+///
+/// This option lets a client opt into the host's narrow base-character width
+/// without changing the default emoji semantics, and without removing VS16 from
+/// the stored grapheme cluster (emoji presentation is preserved for shaping).
+public enum VariationSelector16WidthPolicy: Sendable {
+    /// Widen a width-1 emoji-VS16 base character to 2 columns when followed by
+    /// U+FE0F. This is the historical SwiftTerm behavior and the default.
+    case widenToEmojiWidth
+    /// Keep the base character's original width when followed by U+FE0F. The
+    /// VS16 scalar remains part of the stored grapheme cluster (so renderers
+    /// still pick emoji presentation), only the cell width is not widened. Use
+    /// this for local shells whose `wcwidth()` does not widen these bases.
+    case preserveBaseWidth
+}
+
 /// Width to assign to individual (unpaired) Regional Indicator symbols (U+1F1E6–U+1F1FF).
 /// Combined flag pairs (e.g. 🇺🇸) are always rendered as width 2 regardless of this setting.
 public enum RegionalIndicatorWidth: Sendable {
@@ -100,6 +126,11 @@ public struct TerminalOptions {
     /// Width for individual Regional Indicator symbols. `.wide` (default) preserves existing
     /// behavior. `.narrow` matches system wcwidth() and avoids cursor divergence with tmux.
     public var regionalIndicatorWidth: RegionalIndicatorWidth
+    /// Policy for how U+FE0F (VS16) affects the width of a preceding narrow emoji base.
+    /// `.widenToEmojiWidth` (default) preserves existing behavior; `.preserveBaseWidth` keeps
+    /// the base character's original width for compatibility with shells that use a `wcwidth()`
+    /// which does not widen these bases (e.g. macOS `zsh`). The VS16 scalar is never stripped.
+    public var variationSelector16WidthPolicy: VariationSelector16WidthPolicy
     /// BiDi state for new paragraphs after startup or reset.
     public var initialBidiState: BidiPresentationState
     /// Maximum rows that the renderer processes as one BiDi paragraph.
@@ -121,6 +152,7 @@ public struct TerminalOptions {
                                                        kittyImageCacheLimitBytes: 320 * 1024 * 1024,
                                                        ansi256PaletteStrategy: .base16Lab,
                                                        regionalIndicatorWidth: .wide,
+                                                       variationSelector16WidthPolicy: .widenToEmojiWidth,
                                                        initialBidiState: .default,
                                                        maximumBidiParagraphRows: 500,
                                                        initialBidiArrowKeySwap: false)
@@ -128,6 +160,7 @@ public struct TerminalOptions {
   public init(cols: Int = Self.default.cols, rows: Int = Self.default.rows, convertEol: Bool = Self.default.convertEol, termName: String = Self.default.termName, cursorStyle: CursorStyle = Self.default.cursorStyle, screenReaderMode: Bool = Self.default.screenReaderMode, scrollback: Int = Self.default.scrollback, tabStopWidth: Int = Self.default.tabStopWidth,
               enableSixelReported: Bool = Self.default.enableSixelReported, kittyImageCacheLimitBytes: Int = Self.default.kittyImageCacheLimitBytes, ansi256PaletteStrategy: Ansi256PaletteStrategy = Self.default.ansi256PaletteStrategy,
               regionalIndicatorWidth: RegionalIndicatorWidth = Self.default.regionalIndicatorWidth,
+              variationSelector16WidthPolicy: VariationSelector16WidthPolicy = Self.default.variationSelector16WidthPolicy,
               initialBidiState: BidiPresentationState = Self.default.initialBidiState,
               maximumBidiParagraphRows: Int = Self.default.maximumBidiParagraphRows,
               initialBidiArrowKeySwap: Bool = Self.default.initialBidiArrowKeySwap) {
@@ -143,6 +176,7 @@ public struct TerminalOptions {
         self.kittyImageCacheLimitBytes = kittyImageCacheLimitBytes
         self.ansi256PaletteStrategy = ansi256PaletteStrategy
         self.regionalIndicatorWidth = regionalIndicatorWidth
+        self.variationSelector16WidthPolicy = variationSelector16WidthPolicy
         self.initialBidiState = initialBidiState
         self.maximumBidiParagraphRows = max(1, maximumBidiParagraphRows)
         self.initialBidiArrowKeySwap = initialBidiArrowKeySwap

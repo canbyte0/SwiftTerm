@@ -1508,7 +1508,16 @@ open class Terminal {
                                 }
                             }
                             if isVs16 {
-                                if oldSize != 2 && lastx + 1 < cols {
+                                // Preserve the base character's original width when the
+                                // compatibility policy is enabled: do not widen to 2 and do
+                                // not insert a trailing width-0 continuation cell. The VS16
+                                // scalar is already part of `newCh`, so emoji presentation is
+                                // preserved for shaping; only the cell column width stays
+                                // equal to the base character's pre-VS16 width (matching hosts
+                                // whose `wcwidth()` does not widen these bases, e.g. macOS zsh).
+                                if options.variationSelector16WidthPolicy == .preserveBaseWidth {
+                                    updateCharData(&cd, char: newCh, size: Int32(oldSize))
+                                } else if oldSize != 2 && lastx + 1 < cols {
                                     updateCharData(&cd, char: newCh, size: 2)
                                     let nextX = lastx + 1
                                     var empty = makeCharData (attribute: cd.attribute, code: 0, size: 0)
