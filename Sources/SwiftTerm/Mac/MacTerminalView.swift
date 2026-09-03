@@ -2524,7 +2524,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let text = clipboard.string(forType: .string)
         insertText(text ?? "", replacementRange: NSRange(location: 0, length: 0), isPaste: true)
     }
-    
+
+    /// Sends the given text to the program running under the terminal using the
+    /// same paste semantics as a user-initiated paste (``paste(_:)``): when the
+    /// host has enabled bracketed paste mode (DECSET 2004) the text is wrapped
+    /// with the standard `ESC[200~` / `ESC[201~` markers, and any in-progress
+    /// IME marked-text state is cleared first. No trailing Return is sent.
+    ///
+    /// This is the programmatic equivalent of ``paste(_:)`` but accepts an
+    /// arbitrary string instead of reading the system pasteboard, so hosts that
+    /// maintain their own command/snippet UI can feed text through the exact
+    /// same input path the keyboard and clipboard use (the
+    /// ``TerminalViewDelegate.send(source:data:)`` delegate), without bypassing
+    /// bracketed-paste handling or IME marked-text cleanup.
+    ///
+    /// - Parameter text: The text to paste into the terminal input stream. An
+    ///   empty string is a no-op that still clears any active marked-text state.
+    public func pasteText(_ text: String) {
+        insertText(text as Any,
+                   replacementRange: NSRange(location: 0, length: 0),
+                   isPaste: true)
+    }
+
     @objc
     open func copy(_ sender: Any)
     {
