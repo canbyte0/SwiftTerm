@@ -198,6 +198,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     var accessibility: AccessibilityService = AccessibilityService()
     var search: SearchService!
+    /// Optional presentation-only cell background decorations. Consulted once
+    /// per visible row in `buildAttributedString` (the path shared by the
+    /// CoreGraphics and Metal renderers); `nil` — the default — leaves
+    /// rendering identical to upstream. Stored weakly: clients own providers.
+    public weak var highlightProvider: TerminalHighlightProvider?
     var debug: UIView?
     var pendingDisplay: Bool = false
     var textBlinkVisible = true

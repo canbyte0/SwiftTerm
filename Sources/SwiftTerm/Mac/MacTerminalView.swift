@@ -205,6 +205,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var findBar: TerminalFindBarView?
     private var findBarTerm: String = ""
     private var findBarOptions: SearchOptions = SearchOptions()
+    /// Optional presentation-only cell background decorations. Consulted once
+    /// per visible row in `buildAttributedString` (the path shared by the
+    /// CoreGraphics and Metal renderers); `nil` — the default — leaves
+    /// rendering identical to upstream. Stored weakly: clients own providers.
+    public weak var highlightProvider: TerminalHighlightProvider?
     var debug: TerminalDebugView?
     var pendingDisplay: Bool = false
     var textBlinkVisible = true

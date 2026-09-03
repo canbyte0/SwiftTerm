@@ -21,7 +21,7 @@ let SwiftTermUnderlineStyleKey = NSAttributedString.Key("SwiftTermUnderlineStyle
 
 #if os(iOS) || os(visionOS)
 import UIKit
-typealias TTColor = UIColor
+public typealias TTColor = UIColor
 typealias TTFont = UIFont
 typealias TTRect = CGRect
 typealias TTBezierPath = UIBezierPath
@@ -30,7 +30,7 @@ public typealias TTImage = UIImage
 
 #if os(macOS)
 import AppKit
-typealias TTColor = NSColor
+public typealias TTColor = NSColor
 typealias TTFont = NSFont
 typealias TTRect = CGRect
 typealias TTBezierPath = NSBezierPath
@@ -1042,6 +1042,10 @@ extension TerminalView {
     {
         var segments: [ViewLineSegment] = []
         let selectionColumns = selectedColumnsRange(row: row, cols: cols)
+        // Presentation-only decorations from the optional highlight provider.
+        // One query per row; a nil provider (the default) keeps rendering
+        // identical to upstream.
+        let rowHighlights = highlightProvider?.cellHighlights(in: terminal, row: row)
         var col = 0
         var builder: ViewLineSegmentBuilder?
 
@@ -1073,6 +1077,7 @@ extension TerminalView {
         var lastHasUrl = false
         var lastIsSelected = false
         var lastBlinkHidden = false
+        var lastHighlightColor: TTColor? = nil
 
         func flushPending() {
             if !pendingText.isEmpty, let attrs = pendingAttrs {
@@ -1123,18 +1128,28 @@ extension TerminalView {
 
             let isSelected = isColumnSelected(selectionColumns, column: col, width: width)
             let blinkHidden = !textBlinkVisible && attr.style.contains(.blink)
+            var highlightColor: TTColor? = nil
+            if let rowHighlights {
+                for highlight in rowHighlights
+                where col >= highlight.startColumn && col < highlight.endColumn {
+                    highlightColor = highlight.color
+                    break
+                }
+            }
 
             // Flush batch when attributes change; the batch dictionary is only
             // rebuilt at these boundaries, so unchanged cells append without
             // copying it.
             if attr != lastAttr || hasUrl != lastHasUrl || isSelected != lastIsSelected
                 || blinkHidden != lastBlinkHidden
+                || highlightColor != lastHighlightColor
                 || pendingAttrs == nil {
                 flushPending()
                 lastAttr = attr
                 lastHasUrl = hasUrl
                 lastIsSelected = isSelected
                 lastBlinkHidden = blinkHidden
+                lastHighlightColor = highlightColor
                 var batchAttributes = attributes
                 if isSelected {
                     batchAttributes[.selectionBackgroundColor] = selectedTextBackgroundColor
@@ -1145,6 +1160,13 @@ extension TerminalView {
                     if batchAttributes[.strikethroughColor] != nil {
                         batchAttributes[.strikethroughColor] = selectedTextForegroundColor
                     }
+                } else if let highlightColor {
+                    // Presentation-only cell decoration supplied by the host
+                    // app. It rides the selection-background channel so both
+                    // the CoreGraphics and Metal renderers paint it above the
+                    // ANSI background without touching the foreground color,
+                    // and it never overrides an actual selection.
+                    batchAttributes[.selectionBackgroundColor] = highlightColor
                 }
                 if blinkHidden {
                     batchAttributes[.foregroundColor] = TTColor.clear
