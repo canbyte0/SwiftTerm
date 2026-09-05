@@ -2239,15 +2239,48 @@ extension TerminalView {
 
                     if let scaledFits {
                         // Rare path: at least one glyph overflowed its slot and is
-                        // drawn individually at a reduced point size.
+                        // drawn individually, scaled down around its own origin.
                         for i in 0..<runGlyphsCount {
                             let s = scaledFits[i].scale
-                            let drawFont: CTFont = s == 1
-                                ? ctRunFont
-                                : CTFontCreateCopyWithAttributes(ctRunFont, CTFontGetSize(ctRunFont) * s, nil, nil)
                             var g = runGlyphs[i]
                             var p = glyphPositions[i]
-                            CTFontDrawGlyphs(drawFont, &g, &p, 1, context)
+                            if prepared.segment.columnWidth == 1 && s != 1 {
+                                // Single-cell overflowing fallback glyphs (e.g. an
+                                // Apple Color Emoji glyph shaped for a width-1
+                                // ⚠️/❤️ cell under preserveBaseWidth): draw the
+                                // ORIGINAL font under a local uniform CGContext
+                                // transform anchored at the glyph origin — never a
+                                // scaled CTFont copy. Copying a bitmap (sbix) font
+                                // to a new point size re-selects a bitmap strike
+                                // whose declared ink is NOT ink × s (the ink/size
+                                // ratio is piecewise-constant per strike), so the
+                                // raster still overflowed the cell by up to ~25%
+                                // (Phase 9D-C real-pixel evidence: +3.0pt right
+                                // overflow at 24pt). The transform scales the
+                                // glyph's local coordinates by s exactly as the fit
+                                // math intends — no strike re-selection — and the
+                                // save/restore pair confines it to this glyph:
+                                // neighbors, separators, decorations, highlight,
+                                // selection, and the cursor are unaffected.
+                                context.saveGState()
+                                context.translateBy(x: p.x, y: p.y)
+                                context.scaleBy(x: s, y: s)
+                                var local = CGPoint.zero
+                                CTFontDrawGlyphs(ctRunFont, &g, &local, 1, context)
+                                context.restoreGState()
+                            } else {
+                                // Wide (columnWidth >= 2, CJK / full-width) cells
+                                // keep the historical reduced-point-size copy: those
+                                // runs are vector outlines (base font / PingFang SC)
+                                // whose hinted raster scales linearly with point
+                                // size, and Phase 9D-C's real-raster probe showed
+                                // the wide path contained at 10-32pt. Do not change
+                                // it (out of Phase 9D-D scope).
+                                let drawFont: CTFont = s == 1
+                                    ? ctRunFont
+                                    : CTFontCreateCopyWithAttributes(ctRunFont, CTFontGetSize(ctRunFont) * s, nil, nil)
+                                CTFontDrawGlyphs(drawFont, &g, &p, 1, context)
+                            }
                         }
                     } else {
                         CTFontDrawGlyphs(runFont, runGlyphs, &glyphPositions, glyphPositions.count, context)
