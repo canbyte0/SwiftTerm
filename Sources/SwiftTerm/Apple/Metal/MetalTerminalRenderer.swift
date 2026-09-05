@@ -1303,13 +1303,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             intraCluster = 0
                         }
                         let glyphColumn = shaped.segment.column + (ordinal * shaped.segment.columnWidth)
-                        // Center full-width (CJK) and substituted glyphs within
+                        // Center full-width (CJK) / substituted glyphs within
                         // their multi-cell slot instead of pinning them to the
-                        // cell's left edge, mirroring the CoreGraphics path. The
-                        // decoration loops below keep using the grid column, so
-                        // underlines/strikethroughs stay cell-aligned.
-                        let fit = shaped.segment.columnWidth >= 2
-                            ? terminalView.glyphSlotFit(font: glyphRun.font,
+                        // cell's left edge, and fit overflowing single-cell
+                        // fallback glyphs (e.g. an Apple Color Emoji glyph shaped
+                        // for a width-1 ⚠️/❤️ cell) down into their cell, mirroring
+                        // the CoreGraphics path exactly (both call the shared
+                        // `glyphSlotFit`). The decoration loops below keep using
+                        // the grid column, so underlines/strikethroughs stay
+                        // cell-aligned. Base-font single-cell glyphs (ASCII /
+                        // Latin) are skipped so the hot path stays identity.
+                        let needsFit = shaped.segment.columnWidth >= 2
+                            || (shaped.segment.columnWidth == 1
+                                && !terminalView.isBaseFont(glyphRun.font as CTFont))
+                        let fit = needsFit
+                            ? terminalView.glyphSlotFit(font: glyphRun.font as CTFont,
                                                         glyph: glyph,
                                                         columnWidth: shaped.segment.columnWidth)
                             : GlyphSlotFit.identity

@@ -194,6 +194,39 @@ private func cachedCTLine(_ text: NSAttributedString) -> CTLine {
     return line
 }
 
+/// Stable identity for a `CTFont` used as a `glyphFitCache` key. Toll-free
+/// bridging gives a class instance whose `ObjectIdentifier` is constant for
+/// the font object's lifetime. The cache key also carries `cellWidth` and
+/// `cellHeight`, so a font-size change — which recomputes `cellDimension` —
+/// produces a different key and can never reuse a fit computed for the
+/// previous size; no explicit invalidation is needed.
+@inline(__always)
+private func glyphFitFontID(_ font: CTFont) -> ObjectIdentifier {
+    #if os(macOS)
+    return ObjectIdentifier(font as NSFont)
+    #elseif os(iOS) || os(visionOS)
+    return ObjectIdentifier(font as UIFont)
+    #endif
+}
+
+/// Cache key for `glyphSlotFit`. Captures the font identity, the glyph, the
+/// slot width (columnWidth) and the live cell dimensions, so two different
+/// fallback fonts, two different glyphs, or two different sizes never collide.
+private struct GlyphFitKey: Hashable {
+    let fontID: ObjectIdentifier
+    let glyph: CGGlyph
+    let columnWidth: Int
+    let cellWidth: CGFloat
+    let cellHeight: CGFloat
+}
+
+/// Cached `GlyphSlotFit` results for `glyphSlotFit`. Both the CoreGraphics and
+/// Metal glyph paths consult it so the per-glyph CoreText advance/ink lookups
+/// run at most once per (font, glyph, cell) tuple. Main-thread only, like the
+/// draw path; bounded the same way as `cgColorCache`/`fallbackFontCache`.
+private var glyphFitCache: [GlyphFitKey: GlyphSlotFit] = [:]
+private let glyphFitCacheLimit = 1024
+
 // Holds the information used to render a line
 struct ViewLineInfo {
     // Contains the generated segments for this line
@@ -439,19 +472,81 @@ extension TerminalView {
     }
 
     /// Computes how to center `glyph` within its `columnWidth`-cell slot (and
-    /// scale it down if its ink overflows). Returns ``GlyphSlotFit/identity`` for
-    /// ordinary single-cell glyphs, so Latin text in a monospace font is rendered
-    /// exactly as before and the hot path stays untouched. Shared by the
-    /// CoreGraphics and Metal glyph renderers so they stay pixel-consistent.
+    /// scale it down if its ink overflows). Returns ``GlyphSlotFit/identity``
+    /// for ordinary single-cell glyphs in the base monospace font, so Latin
+    /// text is rendered exactly as before and the hot path stays untouched.
+    ///
+    /// Wide cells (CJK / full-width emoji, `columnWidth >= 2`) and overflowing
+    /// single-cell fallback glyphs (e.g. an Apple Color Emoji glyph shaped for
+    /// a width-1 `⚠️`/`❤️` cell whose ink is wider than the cell) are both fitted
+    /// with the same uniform-scale + center transform. Single-cell glyphs in
+    /// the base font never overflow (ink <= em by design), so the Latin/ASCII
+    /// hot path returns identity without any metric lookup.
+    ///
+    /// Shared by the CoreGraphics and Metal glyph renderers (both call this
+    /// method) so they stay pixel-consistent, and cached by
+    /// (font, glyph, columnWidth, cellWidth, cellHeight) so the CoreText
+    /// advance/ink lookups run at most once per tuple.
     func glyphSlotFit (font: CTFont, glyph: CGGlyph, columnWidth: Int) -> GlyphSlotFit
     {
-        // Only wide cells need adjusting: a single-width glyph in a monospace
-        // font already fills its cell, so we skip the metric lookups entirely.
-        guard columnWidth >= 2, cellDimension != nil else { return .identity }
+        guard let cellDim = cellDimension else { return .identity }
+        let key = GlyphFitKey(fontID: glyphFitFontID(font),
+                              glyph: glyph,
+                              columnWidth: columnWidth,
+                              cellWidth: cellDim.width,
+                              cellHeight: cellDim.height)
+        if let cached = glyphFitCache[key] {
+            return cached
+        }
+        let result = computeGlyphFit(font: font, glyph: glyph, columnWidth: columnWidth,
+                                     cellWidth: cellDim.width, cellHeight: cellDim.height)
+        if glyphFitCache.count >= glyphFitCacheLimit {
+            glyphFitCache.removeAll(keepingCapacity: true)
+        }
+        glyphFitCache[key] = result
+        return result
+    }
 
-        let cellWidth = cellDimension.width
-        let cellHeight = cellDimension.height
+    /// True when `font` is one of this terminal's four primary base-font
+    /// members — normal / bold / italic / boldItalic. Single-cell glyphs in
+    /// the base set never overflow their cell, so the Latin/ASCII hot path
+    /// (including styled bold/italic/boldItalic ASCII) skips the fallback
+    /// ink-overflow fit entirely and stays identity.
+    ///
+    /// All four members must be recognized: `FontSet` derives bold / italic /
+    /// boldItalic from the normal face via `NSFontManager.convert`, which
+    /// returns distinct font objects. The original implementation compared
+    /// only against `fontSet.normal` (object identity), so it mis-classified
+    /// styled ASCII runs as fallback fonts and shrank/shifted them (a
+    /// regression from the `columnWidth >= 2` baseline gate, which skipped
+    /// every single-cell run). Recognizing all four members restores that
+    /// invariant: styled ASCII stays identity while true fallback fonts
+    /// (Apple Color Emoji, PingFang SC, …) — different objects that are never
+    /// equal to any base member — still flow into the ink-overflow fit.
+    func isBaseFont (_ font: CTFont) -> Bool
+    {
+        let id = glyphFitFontID(font)
+        return id == glyphFitFontID(fontSet.normal as CTFont)
+            || id == glyphFitFontID(fontSet.bold as CTFont)
+            || id == glyphFitFontID(fontSet.italic as CTFont)
+            || id == glyphFitFontID(fontSet.boldItalic as CTFont)
+    }
+
+    /// Pure, side-effect-free fit computation shared by the cached
+    /// ``glyphSlotFit`` entry point. Both CoreGraphics and Metal ultimately
+    /// consume the `GlyphSlotFit` this produces, so the two renderers can never
+    /// diverge in their presentation transform.
+    private func computeGlyphFit (font: CTFont, glyph: CGGlyph, columnWidth: Int,
+                                   cellWidth: CGFloat, cellHeight: CGFloat) -> GlyphSlotFit
+    {
         let slotWidth = CGFloat(columnWidth) * cellWidth
+
+        // Fast path: a single-cell glyph drawn in the base monospace font
+        // already fills its cell (ink <= em by design); skip the metric
+        // lookups entirely and keep the Latin/ASCII hot path identity.
+        if columnWidth == 1, isBaseFont(font) {
+            return .identity
+        }
 
         var g = glyph
         var advance = CGSize.zero
@@ -461,16 +556,20 @@ extension TerminalView {
         var ink = CGRect.zero
         CTFontGetBoundingRectsForGlyphs(font, .horizontal, &g, &ink, 1)
 
-        // Scale down only when the ink would spill outside its slot (rare; this
-        // protects oversized substitute glyphs). Never enlarge.
+        // Scale down only when the ink would spill outside its slot (the
+        // correctness gate: a glyph whose ink fits is never scaled). Never
+        // enlarge — `scale` is clamped to <= 1.
         var scale: CGFloat = 1
         if ink.width > slotWidth || ink.height > cellHeight, ink.width > 0, ink.height > 0 {
             scale = max(0.1, min(min(slotWidth / ink.width, cellHeight / ink.height), 1))
         }
 
-        // Center the (scaled) advance box horizontally in the slot. Centering by
-        // advance rather than ink keeps glyphs that are intentionally off-center
-        // within their em square — e.g. the CJK comma `、` — in their place.
+        // Center the (scaled) advance box horizontally in the slot. Centering
+        // by advance rather than ink keeps glyphs that are intentionally
+        // off-center within their em square — e.g. the CJK comma `、` — in
+        // their place. This matches the user-approved Phase 9D-A "uniform fit"
+        // preview exactly (Apple Color Emoji advance ≈ ink for the square
+        // emoji glyphs, so advance- and ink-centering coincide to sub-pixel).
         let dx = (slotWidth - advance.width * scale) / 2
 
         // Preserve the natural Latin baseline unless the glyph was scaled, in
@@ -2112,14 +2211,20 @@ extension TerminalView {
                     context.setFillColor(
                         cachedCGColor(preparedRun.foregroundColor ?? effectiveNativeForegroundColor))
 
-                    // Center full-width (CJK) and substituted glyphs within their
+                    // Center full-width (CJK) / substituted glyphs within their
                     // multi-cell slot instead of pinning them to the cell's left
-                    // edge. `positions` stays grid-aligned for the decorations
-                    // below; only `glyphPositions` is shifted/scaled.
+                    // edge, and fit overflowing single-cell fallback glyphs
+                    // (e.g. an Apple Color Emoji glyph shaped for a width-1
+                    // ⚠️/❤️ cell) down into their cell. `positions` stays
+                    // grid-aligned for the decorations below; only
+                    // `glyphPositions` is shifted/scaled. Base-font
+                    // single-cell glyphs (ASCII / Latin) are skipped so the hot
+                    // path never pays a metric lookup.
                     let ctRunFont = runFont as CTFont
                     var glyphPositions = positions
                     var scaledFits: [GlyphSlotFit]? = nil
-                    if prepared.segment.columnWidth >= 2 {
+                    if prepared.segment.columnWidth >= 2
+                        || (prepared.segment.columnWidth == 1 && !isBaseFont(ctRunFont)) {
                         var computed = [GlyphSlotFit](repeating: .identity, count: runGlyphsCount)
                         var anyScaled = false
                         for i in 0..<runGlyphsCount {
