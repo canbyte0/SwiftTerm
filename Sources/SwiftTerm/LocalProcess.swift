@@ -75,7 +75,13 @@ public class LocalProcess {
     var total = 0
 
     weak var delegate: LocalProcessDelegate?
-    
+
+    // Shared input-transport authority for the PTY: every byte entering the
+    // child (keyboard, paste, acknowledged writes, exclusive transactions) is
+    // serialized through this single object so cross-source ordering is
+    // deterministic. This is generic transport infrastructure.
+    public let inputTransport = LocalProcessInputTransport()
+
     // Queue used to send the data received from the local process
     var dispatchQueue: DispatchQueue
     
@@ -209,7 +215,13 @@ public class LocalProcess {
     }
     
     /**
-     * Sends the array slice to the local process using DispatchIO
+     * Sends the array slice to the local process.
+     *
+     * The bytes are enqueued on the shared input-transport authority (the
+     * same stream-ordered path used by acknowledged writes and exclusive
+     * input transactions), so ordering across input sources is
+     * deterministic. The observable API stays fire-and-forget: no new errors
+     * are surfaced to callers.
      * - Parameter data: The range of bytes to send to the child process
      */
     public func send (data: ArraySlice<UInt8>)
@@ -219,25 +231,19 @@ public class LocalProcess {
         }
         let copy = sendCount
         sendCount += 1
-        data.withUnsafeBytes { ptr in
-            let ddata = DispatchData(bytes: ptr)
-            let copyCount = ddata.count
-            if debugIO {
-                print ("[SEND-\(copy)] Queuing data to client: \(data) ")
-            }
-
-            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { [weak self] dd, errno in
-                guard let self else { return }
-                self.total += copyCount
-                if self.debugIO {
-                    print ("[SEND-\(copy)] completed bytes=\(self.total)")
-                }
-                if errno != 0 {
-                    print ("Error writing data to the child, errno=\(errno)")
-                }
-            })
+        if debugIO {
+            print ("[SEND-\(copy)] Queuing data to client: \(data) ")
         }
-
+        inputTransport.enqueueOrdinarySend (data) { [weak self] accepted, errno in
+            guard let self else { return }
+            self.total += accepted
+            if self.debugIO {
+                print ("[SEND-\(copy)] completed accepted=\(accepted) total=\(self.total)")
+            }
+            if errno != 0 {
+                print ("Error writing data to the child, errno=\(errno)")
+            }
+        }
     }
     
     /* Used to generate the next file name counter */
@@ -268,6 +274,7 @@ public class LocalProcess {
 
     func childStopped(cancelProcessMonitor: Bool = true) {
         running = false
+        inputTransport.processStopped ()
 #if os(macOS)
         if cancelProcessMonitor {
             childMonitor?.cancel()
@@ -358,6 +365,13 @@ public class LocalProcess {
         // intentionally don't send SIGTERM here; terminate() remains the
         // explicit API for killing the shell. deinit only guarantees that
         // our own I/O resources don't outlive us.
+        //
+        // Close ordering (frozen): channelWillClose() first enters the
+        // transport's explicit `closing` state (refuse new writes, fail
+        // queued units, retain any in-flight write), then io.close() forces
+        // that write's terminal backend callback, which settles it exactly
+        // once. The transport survives until settlement (lifetime design B).
+        inputTransport.channelWillClose ()
         io?.close()
         io = nil
     }
@@ -552,6 +566,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
+            inputTransport.adopt (io: io)
             io.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
                 self?.childProcessRead(done: done, data: data, errno: errno)
             }
@@ -575,6 +590,13 @@ public class LocalProcess {
         // The cleanup handler ensures FDs are closed AFTER DispatchIO is done with them,
         // preventing "BUG IN CLIENT OF LIBDISPATCH: Unexpected EV_VANISHED" crash
         // This applies to both Subprocess and forkpty paths
+        //
+        // Close ordering (frozen): channelWillClose() first enters the
+        // transport's explicit `closing` state (refuse new writes, fail
+        // queued units, retain any in-flight write); io.close() then forces
+        // that write's terminal backend callback, which settles it exactly
+        // once — close alone never settles a started write.
+        inputTransport.channelWillClose ()
         io?.close()
         io = nil
         childfd = -1
