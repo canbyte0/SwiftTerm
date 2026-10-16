@@ -36,6 +36,10 @@ public final class Buffer {
     /// so a pixel-based anchor drifts by one row per trimmed line.
     public var totalLinesTrimmed: Int { linesTop }
 
+    /// Installed by the owning terminal so row-level mutations can report
+    /// navigation identities that ceased to resolve.
+    var navigationAnchorInvalidated: ((UUID) -> Void)?
+
 
     /// This is the index into the `lines` array that corresponds to the top row of displayed
     /// content in the terminal when the scroll is zero.   So the terminal contents that the application
@@ -488,6 +492,78 @@ public final class Buffer {
         }
     }
 
+    func setNavigationAnchor(_ identifier: UUID, at position: Position) -> Bool {
+        guard position.row >= 0, position.row < lines.count,
+              position.col >= 0, position.col < lines[position.row].count else {
+            return false
+        }
+        lines[position.row].setNavigationAnchor(identifier, column: position.col)
+        return true
+    }
+
+    func navigationAnchorPosition(for identifier: UUID) -> Position? {
+        var result: Position?
+        for row in 0..<lines.count {
+            if let anchor = lines[row].navigationAnchors.first(where: { $0.identifier == identifier }) {
+                guard result == nil else { return nil }
+                result = Position(col: anchor.column, row: row)
+            }
+        }
+        return result
+    }
+
+    func navigationAnchorsWereInvalidated(_ identifiers: [UUID]) {
+        for identifier in identifiers {
+            navigationAnchorInvalidated?(identifier)
+        }
+    }
+
+    func invalidateAllNavigationAnchors() {
+        guard !lines.isEmpty else { return }
+        for row in 0..<lines.count {
+            lines[row].invalidateAllNavigationAnchors()
+        }
+    }
+
+    private func reconcileNavigationAnchors(afterReflow idsBefore: [UUID]) {
+        var positions: [UUID: [(line: BufferLine, column: Int)]] = [:]
+        for row in 0..<lines.count {
+            for anchor in lines[row].navigationAnchors {
+                positions[anchor.identifier, default: []].append((lines[row], anchor.column))
+            }
+        }
+        let tracked = Set(idsBefore)
+        var invalidated = Set<UUID>()
+        for identifier in tracked {
+            guard let occurrences = positions[identifier], occurrences.count == 1 else {
+                for row in 0..<lines.count {
+                    lines[row].discardNavigationAnchorWithoutNotification(identifier)
+                }
+                navigationAnchorsWereInvalidated([identifier])
+                invalidated.insert(identifier)
+                continue
+            }
+        }
+        for (identifier, occurrences) in positions where occurrences.count > 1 {
+            guard invalidated.insert(identifier).inserted else { continue }
+            for row in 0..<lines.count {
+                lines[row].discardNavigationAnchorWithoutNotification(identifier)
+            }
+            navigationAnchorsWereInvalidated([identifier])
+        }
+    }
+
+    /// Invalidates IDs on rows that will leave the live list before advancing
+    /// its circular start index.
+    func trimStartLines(count: Int) {
+        let trimmedCount = min(max(count, 0), lines.count)
+        guard trimmedCount > 0 else { return }
+        for row in 0..<trimmedCount {
+            lines[row].invalidateAllNavigationAnchors()
+        }
+        lines.trimStart(count: trimmedCount)
+    }
+
     var activeSemanticPromptOrigin: Position? {
         // D.3: resolve the row here, but take the mark selection from
         // `rawSemanticOrigin` so the initial-wins-else-secondary rule lives in
@@ -707,6 +783,7 @@ public final class Buffer {
 
     public func clear ()
     {
+        invalidateAllNavigationAnchors()
         yDisp = 0
         yBase = 0
         xBase = 0
@@ -842,7 +919,7 @@ public final class Buffer {
                 // Trim from the top of the buffer and adjust ybase and ydisp.
                 let amountToTrim = lines.count - newMaxLength
                 if amountToTrim > 0 {
-                    lines.trimStart(count: amountToTrim)
+                    trimStartLines(count: amountToTrim)
                     yBase = max (yBase - amountToTrim, 0)
                     yDisp = max (yDisp - amountToTrim, 0)
                     savedY = max (savedY - amountToTrim, 0)
@@ -909,7 +986,7 @@ public final class Buffer {
             return
         }
         let amountToTrim = yBase
-        lines.trimStart (count: amountToTrim)
+        trimStartLines(count: amountToTrim)
         yBase = 0
         yDisp = 0
         savedY = max (savedY - amountToTrim, 0)
@@ -931,7 +1008,7 @@ public final class Buffer {
                 // Decrease buffer size - need to trim and adjust
                 let amountToTrim = lines.count - newMaxLength
                 if amountToTrim > 0 {
-                    lines.trimStart(count: amountToTrim)
+                    trimStartLines(count: amountToTrim)
                     yBase = max(yBase - amountToTrim, 0)
                     yDisp = max(yDisp - amountToTrim, 0)
                     savedY = max(savedY - amountToTrim, 0)
@@ -1535,6 +1612,9 @@ public final class Buffer {
         if cols == newCols {
             return
         }
+        let navigationIDsBefore = (0..<lines.count).flatMap { row in
+            lines[row].navigationAnchors.map(\.identifier)
+        }
         // iterate through rows, ignore the last one as it cannot be wrapped
 
         if newCols > cols {
@@ -1543,6 +1623,7 @@ public final class Buffer {
             reflowNarrower (cols, rows, newCols, newRows)
         }
         recalculateLinesWithImagesCount()
+        reconcileNavigationAnchors(afterReflow: navigationIDsBefore)
     }
     
     static var n = 0

@@ -257,6 +257,10 @@ internal class CircularBufferLineList {
                 for i in 0..<top {
                     newArray [i] = array [getCyclicIndex(i)]
                 }
+                let retained = Set(newArray.compactMap { $0.map(ObjectIdentifier.init) })
+                for line in array.compactMap({ $0 }) where !retained.contains(ObjectIdentifier(line)) {
+                    line.invalidateAllNavigationAnchors()
+                }
                 startIndex = 0
                 array = newArray
                 return
@@ -317,7 +321,11 @@ internal class CircularBufferLineList {
     func push (_ value: BufferLine)
     {
         onLineAttached?(value)
-        array [getCyclicIndex(count)] = value
+        let index = getCyclicIndex(count)
+        if count == array.count, let displaced = array[index], displaced !== value {
+            displaced.invalidateAllNavigationAnchors()
+        }
+        array [index] = value
         if count == array.count {
             startIndex = startIndex + 1
             if startIndex == array.count {
@@ -349,11 +357,15 @@ internal class CircularBufferLineList {
     func pop () -> BufferLine {
         let v = array [getCyclicIndex(count-1)]!
         count = count - 1
+        v.invalidateAllNavigationAnchors()
         return v
     }
 
     func splice (start: Int, deleteCount: Int, items: [BufferLine], change: (Int) -> Void)
     {
+        let removedLines = deleteCount > 0
+            ? (start..<min(start + deleteCount, count)).map { self[$0] }
+            : []
         if deleteCount > 0 {
             var i = start
             let limit = count-deleteCount
@@ -381,19 +393,38 @@ internal class CircularBufferLineList {
             array [getCyclicIndex(start + i)] = items [i]
         }
 
-        // Adjust length as needed
-        if Int(count) + ic > array.count {
-            let countToTrim = count + items.count - array.count
+        // Capture the exact logical prefix that the capacity trim discards.
+        // Structural edits can touch a large scrollback list, so avoid a full
+        // list snapshot merely to find the few detached rows.
+        let countToTrim = max(0, count + items.count - array.count)
+        let trimmedLines = countToTrim > 0
+            ? (0..<min(countToTrim, array.count)).map { self[$0] }
+            : []
+        if countToTrim > 0 {
             startIndex = startIndex + countToTrim
             count = array.count
         } else {
             count = count + items.count
+        }
+        let insertedIDs = Set(items.map(ObjectIdentifier.init))
+        var discarded = Set< ObjectIdentifier >()
+        for line in removedLines where !insertedIDs.contains(ObjectIdentifier(line)) {
+            discarded.insert(ObjectIdentifier(line))
+            line.invalidateAllNavigationAnchors()
+        }
+        for line in trimmedLines where discarded.insert(ObjectIdentifier(line)).inserted {
+            line.invalidateAllNavigationAnchors()
         }
      }
 
     func trimStart (count: Int)
     {
         let c = count > self.count ? self.count : count
+        if c > 0 {
+            for i in 0..<c {
+                self[i].invalidateAllNavigationAnchors()
+            }
+        }
         startIndex = startIndex + c
         self.count -= count
     }
@@ -417,7 +448,13 @@ internal class CircularBufferLineList {
         if start+offset <= 0 {
             return dumpState ("start+offset <= 0")
         }
+        var discardedLines: [BufferLine] = []
         if offset > 0 {
+            let firstOverwritten = start + count
+            let afterOverwritten = min(firstOverwritten + offset, self.count)
+            if firstOverwritten < afterOverwritten {
+                discardedLines.append(contentsOf: (firstOverwritten..<afterOverwritten).map { self[$0] })
+            }
             for i in (0..<count).reversed() {
                 array[getCyclicIndex(start + i + offset)] = array[getCyclicIndex(start + i)]
             }
@@ -425,15 +462,24 @@ internal class CircularBufferLineList {
             if expandListBy > 0 {
                 self._count += expandListBy
                 while self._count > maxLength {
+                    discardedLines.append(self[0])
                     self._count -= 1
                     startIndex += 1
                     // trimmed callback invoke
                 }
             }
         } else {
+            let firstOverwritten = max(0, start + offset)
+            if firstOverwritten < start {
+                discardedLines.append(contentsOf: (firstOverwritten..<start).map { self[$0] })
+            }
             for i in 0..<count {
                 array[getCyclicIndex(start + i + offset)] = array[getCyclicIndex(start + i)]
             }
+        }
+        var discardedIDs = Set< ObjectIdentifier >()
+        for line in discardedLines where discardedIDs.insert(ObjectIdentifier(line)).inserted {
+            line.invalidateAllNavigationAnchors()
         }
         return true
     }

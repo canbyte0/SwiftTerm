@@ -375,6 +375,26 @@ open class Terminal {
      */
     public private(set) var buffer: Buffer
 
+    private let navigationTerminalID = UUID()
+    private let semanticEventObservers = SemanticEventObserverStore()
+    private var semanticEventSequence: UInt64 = 0
+    public private(set) var semanticRuntimeGeneration = SemanticRuntimeGeneration(rawValue: 0)
+    private enum NavigationPromptStage {
+        case prompt
+        case input
+        case started
+        case finished
+        case invalidated
+    }
+    private struct NavigationPromptCandidate {
+        var groupID: UInt64
+        let anchor: TerminalNavigationAnchor
+        var stage = NavigationPromptStage.prompt
+        var localPromptToken: String?
+        var localPromptTokenConflict = false
+    }
+    private var navigationPromptCandidate: NavigationPromptCandidate?
+
     /// Controls whether primary pointer clicks are routed to an active OSC 133
     /// semantic prompt. Views use this when deciding whether a click should
     /// take precedence over local selection, links, or ordinary mouse reports.
@@ -791,6 +811,7 @@ open class Terminal {
         setupTabStops()
 
         setup()
+        installNavigationAnchorInvalidationHandler()
     }
 
     deinit {
@@ -879,8 +900,11 @@ open class Terminal {
     }
     
     public func resetNormalBuffer() {
+        navigationPromptCandidate = nil
+        normalBuffer.invalidateAllNavigationAnchors()
         normalBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth,
                               scrollback: options.scrollback, bidiState: currentBidiState)
+        installNavigationAnchorInvalidationHandler()
         normalBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
 
         normalBuffer.fillViewportRows()
@@ -1939,6 +1963,106 @@ open class Terminal {
         buffer.activeSemanticPromptOrigin
     }
 
+    /// Observes completed, validated OSC 133 events in parser order.
+    ///
+    /// Delivery is synchronous on the same processing thread that calls
+    /// `feed`. Repeated subscriptions are independent. Canceling an
+    /// observation is idempotent; a handler already present in the current
+    /// dispatch snapshot may receive that one event.
+    public func observeSemanticEvents(_ handler: @escaping (SemanticPromptEvent) -> Void) -> SemanticEventObservation {
+        semanticEventObservers.observe(handler)
+    }
+
+    /// Starts a new local-shell or remote-connection runtime. Event sequence
+    /// numbers continue for the lifetime of this Terminal, while every event
+    /// captures the generation active when it was accepted. Call this and
+    /// feed data on the Terminal's serialized processing thread. Hosts must
+    /// use a generation-tagged `feed` overload for transport callbacks that
+    /// may arrive after a runtime has been replaced.
+    public func beginSemanticRuntime(_ generation: SemanticRuntimeGeneration,
+                                     preservingExistingAnchors: Bool) {
+        parser.reset()
+        semanticRuntimeGeneration = generation
+        navigationPromptCandidate = nil
+        resetSemanticPromptState(clearingScreenMarks: false)
+        if !preservingExistingAnchors {
+            normalBuffer.invalidateAllNavigationAnchors()
+        }
+    }
+
+    /// Resolves an anchor against this Terminal's live primary buffer.
+    /// Anchors from another Terminal, erased origins, and discarded rows
+    /// return nil; the row and column are never used as identity.
+    public func resolveNavigationAnchor(_ anchor: TerminalNavigationAnchor) -> Position? {
+        guard anchor.terminalID == navigationTerminalID else { return nil }
+        return normalBuffer.navigationAnchorPosition(for: anchor.identifier)
+    }
+
+    private func installNavigationAnchorInvalidationHandler() {
+        normalBuffer.navigationAnchorInvalidated = { [weak self] identifier in
+            guard let self else { return }
+            let anchor = TerminalNavigationAnchor(terminalID: self.navigationTerminalID,
+                                                  identifier: identifier)
+            self.emitSemanticEvent(.navigationAnchorInvalidated, localToken: nil,
+                                   anchor: anchor)
+        }
+    }
+
+    private func emitSemanticEvent(_ action: SemanticPromptEventAction,
+                                   localToken: String?, anchor: TerminalNavigationAnchor?) {
+        precondition(semanticEventSequence < UInt64.max, "semantic event sequence exhausted")
+        semanticEventSequence += 1
+        semanticEventObservers.emit(SemanticPromptEvent(
+            sequence: semanticEventSequence,
+            runtimeGeneration: semanticRuntimeGeneration,
+            action: action,
+            localToken: localToken,
+            anchor: anchor
+        ))
+    }
+
+    private func navigationAnchorForPrompt(kind: SemanticPromptKind,
+                                           localToken: String?,
+                                           allowsTokenOnlyCommandStart: Bool) -> TerminalNavigationAnchor? {
+        guard kind == .initial,
+              let position = normalBuffer.activeSemanticPromptOrigin else { return nil }
+        let groupID = normalBuffer.activeSemanticGroupID
+        if let candidate = navigationPromptCandidate,
+           let resolvedPosition = resolveNavigationAnchor(candidate.anchor) {
+            let sameSemanticGroup = candidate.groupID == groupID
+            let sameUnexecutedLocalPrompt = allowsTokenOnlyCommandStart &&
+                candidate.stage == .prompt &&
+                !candidate.localPromptTokenConflict &&
+                (candidate.localPromptToken == nil || candidate.localPromptToken == localToken) &&
+                resolvedPosition == position
+            if sameSemanticGroup || sameUnexecutedLocalPrompt {
+                var reusedCandidate = candidate
+                reusedCandidate.groupID = groupID
+                if allowsTokenOnlyCommandStart, let localToken {
+                    if let previousToken = reusedCandidate.localPromptToken {
+                        if previousToken != localToken {
+                            reusedCandidate.localPromptToken = nil
+                            reusedCandidate.localPromptTokenConflict = true
+                        }
+                    } else if !reusedCandidate.localPromptTokenConflict {
+                        reusedCandidate.localPromptToken = localToken
+                    }
+                }
+                navigationPromptCandidate = reusedCandidate
+                return candidate.anchor
+            }
+        }
+        let anchor = TerminalNavigationAnchor(terminalID: navigationTerminalID,
+                                              identifier: UUID())
+        guard normalBuffer.setNavigationAnchor(anchor.identifier, at: position) else { return nil }
+        navigationPromptCandidate = NavigationPromptCandidate(
+            groupID: groupID,
+            anchor: anchor,
+            localPromptToken: allowsTokenOnlyCommandStart ? localToken : nil
+        )
+        return anchor
+    }
+
     /// Sends user input through the terminal so semantic interaction state and
     /// transport cannot diverge. Hosts should use this path for keyboard,
     /// paste, and programmatic input.
@@ -2096,6 +2220,7 @@ open class Terminal {
     /// prompt state; DECSTR additionally clears the marks on the screen rows
     /// (a full reset is one of the three mark-destruction causes).
     private func resetSemanticPromptState(clearingScreenMarks: Bool) {
+        navigationPromptCandidate = nil
         for screenBuffer in [normalBuffer, altBuffer] {
             screenBuffer.semanticInput = .idle
             screenBuffer.semanticContent = .none
@@ -2103,6 +2228,7 @@ open class Terminal {
             screenBuffer.semanticUsesSpecialCursorKeys = false
             screenBuffer.clearSemanticPromptGroup()
             if clearingScreenMarks {
+                screenBuffer.invalidateAllNavigationAnchors()
                 let top = screenBuffer.yBase
                 let bottom = min(screenBuffer.yBase + rows, screenBuffer.lines.count)
                 for row in top..<bottom {
@@ -2456,6 +2582,22 @@ open class Terminal {
         return result
     }
 
+    /// Local shells may add an opaque decimal execution token to each OSC
+    /// 133 stage. Unknown or malformed IDs do not change existing prompt
+    /// semantics; they simply cannot participate in token-based correlation.
+    private func semanticLocalToken(_ fields: [Substring]) -> String? {
+        let values = fields.compactMap { field -> Substring? in
+            guard let separator = field.firstIndex(of: "="),
+                  field[..<separator] == "id" else { return nil }
+            return field[field.index(after: separator)...]
+        }
+        guard values.count == 1, let token = values.first,
+              !token.isEmpty, token.count <= 20,
+              let number = UInt64(token), number > 0,
+              String(number) == token else { return nil }
+        return String(token)
+    }
+
     /// `A` and `N` perform a fresh-line: CR+LF unless already at the left
     /// margin. `k=r` is exempt and never reaches this.
     private func freshSemanticPromptLine() {
@@ -2474,7 +2616,9 @@ open class Terminal {
         let fields = text.split(separator: ";", omittingEmptySubsequences: false)
         guard let actionField = fields.first, actionField.count == 1,
               let action = actionField.first else { return }
-        guard let options = parseSemanticPromptOptions(Array(fields.dropFirst())) else { return }
+        let optionFields = Array(fields.dropFirst())
+        guard let options = parseSemanticPromptOptions(optionFields) else { return }
+        let localToken = semanticLocalToken(optionFields)
 
         switch action {
         case "A", "N":
@@ -2485,6 +2629,7 @@ open class Terminal {
                 // re-tagging echo as `.prompt` was a defect). It joins the
                 // current group.
                 markCurrentSemanticPrompt(kind: .right)
+                emitSemanticEvent(.prompt, localToken: localToken, anchor: nil)
                 return
             }
             freshSemanticPromptLine()
@@ -2493,6 +2638,7 @@ open class Terminal {
                 // mark (continuation is a derived-only kind).
                 buffer.semanticContent = .prompt(.continuation)
                 buffer.semanticInput = .prompt
+                emitSemanticEvent(.prompt, localToken: localToken, anchor: nil)
                 return
             }
             // R2 group allocation. `N` always allocates. `A;k=i` reuses the
@@ -2527,6 +2673,10 @@ open class Terminal {
             markCurrentSemanticPrompt(kind: kind)
             buffer.semanticContent = .prompt(kind)
             buffer.semanticInput = .prompt
+            let anchor = navigationAnchorForPrompt(kind: kind,
+                                                   localToken: localToken,
+                                                   allowsTokenOnlyCommandStart: false)
+            emitSemanticEvent(.prompt, localToken: localToken, anchor: anchor)
         case "P":
             // A mark action: it classifies the cells that follow but does not
             // move the cursor. `k=s`/`k=c`/`k=r` join the current group;
@@ -2542,13 +2692,54 @@ open class Terminal {
             }
             markCurrentSemanticPrompt(kind: kind)
             buffer.semanticContent = .prompt(kind)
+            let anchor = navigationAnchorForPrompt(kind: kind,
+                                                   localToken: localToken,
+                                                   allowsTokenOnlyCommandStart: true)
+            emitSemanticEvent(.prompt, localToken: localToken, anchor: anchor)
         case "B", "I":
+            let wasArmed = buffer.semanticInput == .armed
             buffer.semanticContent = .input
             buffer.semanticInput = .armed
+            if var candidate = navigationPromptCandidate,
+               candidate.stage == .prompt || candidate.stage == .input {
+                candidate.stage = .input
+                navigationPromptCandidate = candidate
+            }
+            if !wasArmed {
+                let anchor = navigationPromptCandidate.flatMap { candidate in
+                    resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
+                }
+                emitSemanticEvent(.inputStarted, localToken: localToken, anchor: anchor)
+            }
         case "C", "D":
             buffer.semanticContent = .output
             buffer.semanticInput = .submitted
             clearEchoedEnterContinuationBeforeOutput()
+            // Local P/C markers may omit B; tokenless SSH markers need B/I.
+            if action == "C" {
+                if var candidate = navigationPromptCandidate,
+                   !candidate.localPromptTokenConflict,
+                   (candidate.stage == .input &&
+                        (candidate.localPromptToken == nil || candidate.localPromptToken == localToken) ||
+                    candidate.stage == .prompt &&
+                        candidate.localPromptToken != nil &&
+                        candidate.localPromptToken == localToken) {
+                    candidate.stage = .started
+                    navigationPromptCandidate = candidate
+                    let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
+                    emitSemanticEvent(.commandStarted, localToken: localToken, anchor: anchor)
+                }
+            } else if var candidate = navigationPromptCandidate {
+                if candidate.stage == .started {
+                    candidate.stage = .finished
+                    navigationPromptCandidate = candidate
+                    let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
+                    emitSemanticEvent(.commandFinished, localToken: localToken, anchor: anchor)
+                } else if candidate.stage == .prompt || candidate.stage == .input {
+                    candidate.stage = .invalidated
+                    navigationPromptCandidate = candidate
+                }
+            }
         case "L":
             // A fresh-line with no classification change.
             freshSemanticPromptLine()
@@ -3337,7 +3528,7 @@ open class Terminal {
             // Clear scrollback (everything not in viewport)
             let scrollBackSize = buffer.lines.count - rows
             if scrollBackSize > 0 {
-                buffer.lines.trimStart (count: scrollBackSize)
+                buffer.trimStartLines(count: scrollBackSize)
                 buffer.linesTop = 0
                 buffer.yBase = max (buffer.yBase - scrollBackSize, 0)
                 buffer.yDisp = max (buffer.yDisp - scrollBackSize, 0)
@@ -6188,6 +6379,16 @@ open class Terminal {
     {
         parse (buffer: byteArray[...])
     }
+
+    /// Processes bytes only when they belong to the runtime currently bound
+    /// to this Terminal. The untagged overload accepts input as current;
+    /// connection owners should capture their generation when opening a
+    /// PTY/SSH stream and use this overload for every callback so late data
+    /// from a replaced runtime is discarded before parsing.
+    public func feed(byteArray: [UInt8], runtimeGeneration: SemanticRuntimeGeneration) {
+        guard runtimeGeneration == semanticRuntimeGeneration else { return }
+        feed(byteArray: byteArray)
+    }
     
     /**
      * Processes the provided byte-array coming from the host, interprets them and
@@ -6198,6 +6399,12 @@ open class Terminal {
         parse (buffer: ([UInt8] (text.utf8))[...])
     }
 
+    /// String convenience for generation-tagged runtime input.
+    public func feed(text: String, runtimeGeneration: SemanticRuntimeGeneration) {
+        guard runtimeGeneration == semanticRuntimeGeneration else { return }
+        feed(text: text)
+    }
+
     /**
      * Processes the provided byte-array coming from the host, interprets them and
      * updates the screen state accordingly.
@@ -6205,6 +6412,12 @@ open class Terminal {
     public func feed (buffer: ArraySlice<UInt8>)
     {
         parse (buffer: buffer)
+    }
+
+    /// Array-slice form of generation-tagged input used by transport layers.
+    public func feed(buffer: ArraySlice<UInt8>, runtimeGeneration: SemanticRuntimeGeneration) {
+        guard runtimeGeneration == semanticRuntimeGeneration else { return }
+        feed(buffer: buffer)
     }
 
     /**

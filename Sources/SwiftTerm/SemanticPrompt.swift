@@ -81,6 +81,135 @@ public struct SemanticPromptAnchor: Equatable {
     }
 }
 
+/// Identifies one host-managed runtime attached to a terminal.
+///
+/// Hosts should provide a unique value for each local shell or remote
+/// connection instance. Events retain the value that was active when the
+/// parser accepted them, so queued callbacks from an old runtime can be
+/// rejected.
+public struct SemanticRuntimeGeneration: Hashable, Sendable {
+    public let rawValue: UInt64
+
+    public init(rawValue: UInt64) {
+        self.rawValue = rawValue
+    }
+}
+
+/// Opaque identity for one navigation origin in a terminal's primary buffer.
+///
+/// The identity is intentionally not a row, column, line object, or command
+/// string. It remains meaningful while the buffer moves the marked content,
+/// and resolves to `nil` after that origin is erased or discarded.
+public struct TerminalNavigationAnchor: Hashable, Sendable {
+    let terminalID: UUID
+    let identifier: UUID
+
+    init(terminalID: UUID, identifier: UUID) {
+        self.terminalID = terminalID
+        self.identifier = identifier
+    }
+}
+
+/// A parser-ordered semantic event emitted after a complete, valid OSC 133
+/// sequence has updated the terminal's existing semantic prompt state.
+public enum SemanticPromptEventAction: Equatable, Sendable {
+    case prompt
+    case inputStarted
+    case commandStarted
+    case commandFinished
+    case navigationAnchorInvalidated
+}
+
+/// An additive observation of the terminal's OSC 133 semantic stream.
+public struct SemanticPromptEvent: Sendable {
+    /// Strictly increasing for the lifetime of one `Terminal` instance.
+    public let sequence: UInt64
+    /// The runtime generation captured when the event was created.
+    public let runtimeGeneration: SemanticRuntimeGeneration
+    public let action: SemanticPromptEventAction
+    /// A canonical positive decimal UInt64 `id=` extension, when present in
+    /// the OSC action. Hosts scope tokens by `(runtimeGeneration, localToken)`;
+    /// SwiftTerm forwards tokens and does not pair or retain them.
+    public let localToken: String?
+    /// The prompt origin associated with this transition, if it still exists.
+    public let anchor: TerminalNavigationAnchor?
+
+    init(sequence: UInt64, runtimeGeneration: SemanticRuntimeGeneration,
+         action: SemanticPromptEventAction, localToken: String?,
+         anchor: TerminalNavigationAnchor?) {
+        self.sequence = sequence
+        self.runtimeGeneration = runtimeGeneration
+        self.action = action
+        self.localToken = localToken
+        self.anchor = anchor
+    }
+}
+
+/// A cancellable semantic-event subscription.
+public final class SemanticEventObservation {
+    private let lock = NSLock()
+    private var cancellation: (() -> Void)?
+
+    init(cancellation: @escaping () -> Void) {
+        self.cancellation = cancellation
+    }
+
+    /// Stops this subscription. Repeated calls are safe.
+    public func cancel() {
+        lock.lock()
+        let action = cancellation
+        cancellation = nil
+        lock.unlock()
+        action?()
+    }
+
+    deinit {
+        cancel()
+    }
+}
+
+struct NavigationAnchorMark: Equatable {
+    let identifier: UUID
+    var column: Int
+}
+
+final class SemanticEventObserverStore {
+    private struct Entry {
+        let identifier: UUID
+        let handler: (SemanticPromptEvent) -> Void
+    }
+
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+
+    func observe(_ handler: @escaping (SemanticPromptEvent) -> Void) -> SemanticEventObservation {
+        let identifier = UUID()
+        lock.lock()
+        entries.append(Entry(identifier: identifier, handler: handler))
+        lock.unlock()
+        return SemanticEventObservation { [weak self] in
+            self?.remove(identifier)
+        }
+    }
+
+    func emit(_ event: SemanticPromptEvent) {
+        lock.lock()
+        let handlers = entries.map(\.handler)
+        lock.unlock()
+        // Snapshot semantics: canceling or adding subscriptions from a handler
+        // affects the next event, never the dispatch already in progress.
+        for handler in handlers {
+            handler(event)
+        }
+    }
+
+    private func remove(_ identifier: UUID) {
+        lock.lock()
+        entries.removeAll { $0.identifier == identifier }
+        lock.unlock()
+    }
+}
+
 /// A shell-authored mark stored on a buffer line: the `k=` kind and column
 /// of an OSC 133 `A` or `P` action. There is at most one mark per kind per
 /// line; re-marking replaces.

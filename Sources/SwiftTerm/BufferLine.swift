@@ -30,6 +30,8 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Shell-authored OSC 133 marks on this line, at most one per kind.
     /// A line can carry both a left prompt and a right prompt mark.
     private(set) var semanticMarks: [SemanticMark] = [] { didSet { bump() } }
+    /// Navigation identities are sidecar metadata, independent of shell marks.
+    private(set) var navigationAnchors: [NavigationAnchorMark] = []
     /// The prompt-group epoch of a line created by a hard line feed inside a
     /// prompt group: the active group ID at stamp time, or nil for a line that
     /// is not a hard continuation. Together with `isWrapped` this is what makes
@@ -159,6 +161,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         let empty = CharData(attribute: attribute)
         data.update(repeating: empty)
         images = nil
+        invalidateAllNavigationAnchors()
         recycleGeneration &+= 1
         bump()
     }
@@ -168,6 +171,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     func destroySemanticState() {
         semanticMarks.removeAll(keepingCapacity: true)
         semanticHardContinuationGroup = nil
+        invalidateAllNavigationAnchors()
     }
     /// Test whether contains any chars.
     public func hasContent (index: Int) -> Bool {
@@ -206,6 +210,7 @@ public final class BufferLine: CustomDebugStringConvertible {
             }
         }
         marksShift(from: pos, by: n, rightMargin: rightMargin)
+        navigationAnchorsShiftForInsert(from: pos, by: n, rightMargin: rightMargin)
         bump()
     }
 
@@ -227,7 +232,37 @@ public final class BufferLine: CustomDebugStringConvertible {
             }
         }
         marksShift(from: pos, by: -n, rightMargin: rightMargin)
+        navigationAnchorsShiftForDelete(from: pos, by: n, rightMargin: rightMargin)
         bump()
+    }
+
+    private func navigationAnchorsShiftForInsert(from pos: Int, by delta: Int, rightMargin: Int) {
+        guard delta > 0, !navigationAnchors.isEmpty else { return }
+        var invalidated: [UUID] = []
+        navigationAnchors = navigationAnchors.compactMap { anchor in
+            guard anchor.column >= pos, anchor.column <= rightMargin else { return anchor }
+            let shifted = anchor.column + delta
+            guard shifted <= rightMargin else {
+                invalidated.append(anchor.identifier)
+                return nil
+            }
+            return NavigationAnchorMark(identifier: anchor.identifier, column: shifted)
+        }
+        reportNavigationAnchorInvalidation(invalidated)
+    }
+
+    private func navigationAnchorsShiftForDelete(from pos: Int, by count: Int, rightMargin: Int) {
+        guard count > 0, !navigationAnchors.isEmpty else { return }
+        var invalidated: [UUID] = []
+        navigationAnchors = navigationAnchors.compactMap { anchor in
+            guard anchor.column >= pos, anchor.column <= rightMargin else { return anchor }
+            if anchor.column < pos + count {
+                invalidated.append(anchor.identifier)
+                return nil
+            }
+            return NavigationAnchorMark(identifier: anchor.identifier, column: anchor.column - count)
+        }
+        reportNavigationAnchorInvalidation(invalidated)
     }
 
     /// Shifts mark columns with their cells when ICH inserts or DCH deletes
@@ -268,12 +303,59 @@ public final class BufferLine: CustomDebugStringConvertible {
         semanticMarks.sort { $0.column < $1.column }
     }
 
+    func setNavigationAnchor(_ identifier: UUID, column: Int) {
+        guard dataSize > 0 else { return }
+        let safeColumn = min(max(column, 0), dataSize - 1)
+        if let index = navigationAnchors.firstIndex(where: { $0.identifier == identifier }) {
+            navigationAnchors[index].column = safeColumn
+        } else {
+            navigationAnchors.append(NavigationAnchorMark(identifier: identifier, column: safeColumn))
+        }
+    }
+
+    private func invalidateNavigationAnchors(in range: Range<Int>) {
+        guard !range.isEmpty, !navigationAnchors.isEmpty else { return }
+        let invalidated = navigationAnchors.filter { range.contains($0.column) }.map(\.identifier)
+        guard !invalidated.isEmpty else { return }
+        let invalidatedSet = Set(invalidated)
+        navigationAnchors.removeAll { invalidatedSet.contains($0.identifier) }
+        reportNavigationAnchorInvalidation(invalidated)
+    }
+
+    func invalidateAllNavigationAnchors() {
+        guard !navigationAnchors.isEmpty else { return }
+        let invalidated = navigationAnchors.map(\.identifier)
+        navigationAnchors.removeAll(keepingCapacity: true)
+        reportNavigationAnchorInvalidation(invalidated)
+    }
+
+    func invalidateNavigationAnchor(_ identifier: UUID) {
+        guard navigationAnchors.contains(where: { $0.identifier == identifier }) else { return }
+        navigationAnchors.removeAll { $0.identifier == identifier }
+        reportNavigationAnchorInvalidation([identifier])
+    }
+
+    func discardNavigationAnchorWithoutNotification(_ identifier: UUID) {
+        navigationAnchors.removeAll { $0.identifier == identifier }
+    }
+
+    private func reportNavigationAnchorInvalidation(_ identifiers: [UUID]) {
+        guard !identifiers.isEmpty else { return }
+        var reported = Set<UUID>()
+        for identifier in identifiers where reported.insert(identifier).inserted {
+            owningBuffer?.navigationAnchorsWereInvalidated([identifier])
+        }
+    }
+
     /// Replaces the cells in the start to end range with the specified fill data.
     /// Cell erasure never touches the continuation epoch (R1: structural, not
     /// content).
     public func replaceCells (start: Int, end: Int, fillData : CharData)
     {
         let length = dataSize
+        let safeStart = min(max(start, 0), length)
+        let safeEnd = min(max(end, safeStart), length)
+        invalidateNavigationAnchors(in: safeStart..<safeEnd)
         var idx = start
         while idx < end && idx < length {
             data [idx] = fillData
@@ -335,6 +417,7 @@ public final class BufferLine: CustomDebugStringConvertible {
                 data = UnsafeMutableBufferPointer<CharData>.allocate(capacity: 0)
                 dataSize = 0
             }
+            invalidateNavigationAnchors(in: cols..<len)
             marksClampTo(width: cols)
         }
     }
@@ -342,6 +425,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Fills the entire bufferline with the specified ``CharData``
     public func fill (with: CharData)
     {
+        invalidateNavigationAnchors(in: 0..<dataSize)
         data.update(repeating: with)
         bump()
     }
@@ -353,6 +437,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - len: number of columns to fill
     public func fill (with: CharData, atCol: Int, len: Int)
     {
+        let safeStart = min(max(atCol, 0), dataSize)
+        let safeEnd = min(max(atCol + len, safeStart), dataSize)
+        invalidateNavigationAnchors(in: safeStart..<safeEnd)
         for i in 0..<len {
             data [i+atCol] = with
         }
@@ -381,6 +468,12 @@ public final class BufferLine: CustomDebugStringConvertible {
             }
         }
         dataSize = srcSize
+        if line !== self {
+            // A full-line copy leaves the source in place. Its identity stays
+            // with that original row; identities previously owned by the
+            // destination are invalidated because their cells were replaced.
+            invalidateAllNavigationAnchors()
+        }
         isWrapped = line.isWrapped
         semanticMarks = line.semanticMarks
         semanticHardContinuationGroup = line.semanticHardContinuationGroup
@@ -425,6 +518,7 @@ public final class BufferLine: CustomDebugStringConvertible {
                 data[dstCol + i] = src.data[srcCol + i]
             }
         }
+        transferNavigationAnchors(from: src, srcCol: srcCol, dstCol: dstCol, len: len)
         // Marks travel with their cells. The margin-scroll paths and reflow
         // shuffle cell ranges between line objects through this call, and a
         // mark's row is wherever its cells went: this moves marks, it never
@@ -491,6 +585,69 @@ public final class BufferLine: CustomDebugStringConvertible {
             }
         }
         bump()
+    }
+
+    private func transferNavigationAnchors(from src: BufferLine, srcCol: Int,
+                                           dstCol: Int, len: Int) {
+        guard len > 0, !src.navigationAnchors.isEmpty || !navigationAnchors.isEmpty else { return }
+        let sourceRange = srcCol..<(srcCol + len)
+        let destinationRange = dstCol..<(dstCol + len)
+        let moved = src.navigationAnchors.filter { sourceRange.contains($0.column) }
+
+        if src === self {
+            let movedIDs = Set(moved.map(\.identifier))
+            let overwritten = navigationAnchors
+                .filter { destinationRange.contains($0.column) && !movedIDs.contains($0.identifier) }
+                .map(\.identifier)
+            let removed = Set(overwritten + moved.map(\.identifier))
+            navigationAnchors.removeAll { removed.contains($0.identifier) }
+            var existingIDs = Set(navigationAnchors.map(\.identifier))
+            var invalidated = overwritten
+            for anchor in moved {
+                if existingIDs.contains(anchor.identifier) {
+                    navigationAnchors.removeAll { $0.identifier == anchor.identifier }
+                    existingIDs.remove(anchor.identifier)
+                    invalidated.append(anchor.identifier)
+                } else {
+                    navigationAnchors.append(NavigationAnchorMark(
+                        identifier: anchor.identifier,
+                        column: anchor.column - srcCol + dstCol
+                    ))
+                    existingIDs.insert(anchor.identifier)
+                }
+            }
+            reportNavigationAnchorInvalidation(invalidated)
+            return
+        }
+
+        let overwritten = navigationAnchors
+            .filter { destinationRange.contains($0.column) }
+            .map(\.identifier)
+        let overwrittenIDs = Set(overwritten)
+        navigationAnchors.removeAll { overwrittenIDs.contains($0.identifier) }
+        var invalidated = overwritten
+
+        // Reflow and scrolling move ranges inside one buffer. A copy across
+        // buffers must not transplant an identity from the primary buffer.
+        if src.owningBuffer === owningBuffer {
+            let movedIDs = Set(moved.map(\.identifier))
+            src.navigationAnchors.removeAll { movedIDs.contains($0.identifier) }
+            var existingIDs = Set(navigationAnchors.map(\.identifier))
+            for anchor in moved {
+                if existingIDs.contains(anchor.identifier) {
+                    navigationAnchors.removeAll { $0.identifier == anchor.identifier }
+                    existingIDs.remove(anchor.identifier)
+                    invalidated.append(anchor.identifier)
+                } else {
+                    navigationAnchors.append(NavigationAnchorMark(
+                        identifier: anchor.identifier,
+                        column: anchor.column - srcCol + dstCol
+                    ))
+                    existingIDs.insert(anchor.identifier)
+                }
+            }
+        }
+        reportNavigationAnchorInvalidation(invalidated)
     }
 
     /// Returns the contents of the line as a string in the specified range
