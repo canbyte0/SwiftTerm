@@ -392,6 +392,9 @@ open class Terminal {
         var stage = NavigationPromptStage.prompt
         var localPromptToken: String?
         var localPromptTokenConflict = false
+        var allowsTokenOnlyCommandStart = false
+        var runtimeGeneration = SemanticRuntimeGeneration(rawValue: 0)
+        var hasUncertainReflow = false
     }
     private var navigationPromptCandidate: NavigationPromptCandidate?
 
@@ -1998,6 +2001,396 @@ open class Terminal {
         return normalBuffer.navigationAnchorPosition(for: anchor.identifier)
     }
 
+    // MARK: - Synchronous Input Snapshot Capture at OSC 133 C
+
+    private func truncateCharacterPrefix(
+        of text: String,
+        maxGraphemes: Int,
+        maxUTF8Bytes: Int
+    ) -> (prefix: String, isTruncated: Bool) {
+        var result = ""
+        var currentBytes = 0
+        var currentGraphemes = 0
+        var isTruncated = false
+
+        for ch in text {
+            let chBytes = ch.utf8.count
+            if currentGraphemes + 1 > maxGraphemes || currentBytes + chBytes > maxUTF8Bytes {
+                isTruncated = true
+                break
+            }
+            result.append(ch)
+            currentGraphemes += 1
+            currentBytes += chBytes
+        }
+        return (result, isTruncated)
+    }
+
+    /// Captures an immutable input snapshot synchronously at OSC 133 C moment.
+    private func captureInputSnapshotAtC(
+        anchor: TerminalNavigationAnchor?,
+        candidate: NavigationPromptCandidate?,
+        runtimeGeneration: SemanticRuntimeGeneration
+    ) -> TerminalInputSnapshot {
+        guard let anchor = anchor, let anchorPos = resolveNavigationAnchor(anchor) else {
+            return TerminalInputSnapshot(result: .unavailable(.invalidAnchor), scannedRows: 0, scannedCells: 0)
+        }
+
+        guard self.semanticRuntimeGeneration == runtimeGeneration else {
+            return TerminalInputSnapshot(result: .unavailable(.generationMismatch), scannedRows: 0, scannedCells: 0)
+        }
+
+        if let candidate = candidate {
+            guard candidate.anchor == anchor else {
+                return TerminalInputSnapshot(result: .unavailable(.invalidAnchor), scannedRows: 0, scannedCells: 0)
+            }
+            guard candidate.runtimeGeneration == self.semanticRuntimeGeneration else {
+                return TerminalInputSnapshot(result: .unavailable(.generationMismatch), scannedRows: 0, scannedCells: 0)
+            }
+            if candidate.hasUncertainReflow {
+                return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: 0, scannedCells: 0)
+            }
+        }
+
+        if buffer === altBuffer {
+            return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: 0, scannedCells: 0)
+        }
+
+        if buffer.hasReflowedSinceArmedInput {
+            return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: 0, scannedCells: 0)
+        }
+
+        let activeGroup = buffer.activeSemanticGroupID
+        guard activeGroup != 0 else {
+            return TerminalInputSnapshot(result: .unavailable(.promptGroupAmbiguity), scannedRows: 0, scannedCells: 0)
+        }
+
+        let startRow = anchorPos.row
+        guard startRow >= 0, startRow < buffer.lines.count else {
+            return TerminalInputSnapshot(result: .unavailable(.invalidAnchor), scannedRows: 0, scannedCells: 0)
+        }
+
+        let maxPromptSeekRows = 10
+        let maxScanRows = 25
+        let maxScanCols = 512
+
+        var inputStartRow = -1
+        var seekCount = 0
+        var totalScannedCells = 0
+
+        for r in startRow..<min(buffer.lines.count, startRow + maxPromptSeekRows) {
+            seekCount += 1
+            let line = buffer.lines[r]
+
+            if r > startRow {
+                let isContinuation = (line.semanticHardContinuationGroup == activeGroup) || line.isWrapped
+                let hasPromptMark = line.semanticMarks.contains { $0.group == activeGroup }
+                if !isContinuation && !hasPromptMark {
+                    break
+                }
+            }
+
+            if line.hasUncertainAttribution {
+                return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: seekCount, scannedCells: totalScannedCells)
+            }
+
+            let colStart = (r == startRow) ? max(0, anchorPos.col) : 0
+            let colLimit = min(cols, min(line.count, maxScanCols))
+
+            var rowHasInput = false
+            if colStart < colLimit {
+                totalScannedCells += (colLimit - colStart)
+                if line.semanticInputGroup == activeGroup && !line.semanticInputColumns.isEmpty {
+                    if let first = line.semanticInputColumns.integerGreaterThanOrEqualTo(colStart), first < colLimit {
+                        rowHasInput = true
+                    }
+                }
+                if !rowHasInput {
+                    for c in colStart..<colLimit {
+                        if line[c].semanticContent == .input {
+                            rowHasInput = true
+                            break
+                        }
+                    }
+                }
+            }
+
+            if rowHasInput {
+                inputStartRow = r
+                break
+            }
+        }
+
+        guard inputStartRow >= 0 else {
+            if seekCount >= maxPromptSeekRows {
+                return TerminalInputSnapshot(result: .unavailable(.exceededPromptSeekBudget), scannedRows: seekCount, scannedCells: totalScannedCells)
+            }
+            return TerminalInputSnapshot(result: .unavailable(.noInputFound), scannedRows: seekCount, scannedCells: totalScannedCells)
+        }
+
+        enum ScanStopReason {
+            case fullInputComplete
+            case gapEncountered
+            case unknownAttribution
+            case columnBudgetExceeded
+            case rowBudgetExceeded
+        }
+
+        var collectedSegments: [(text: String, isSoftWrapped: Bool)] = []
+        var scannedRows = seekCount
+        var currentRow = inputStartRow
+        var stopReason = ScanStopReason.fullInputComplete
+
+        while currentRow < buffer.lines.count {
+            if currentRow >= inputStartRow + maxScanRows {
+                let line = buffer.lines[currentRow]
+                let isSoftWrapped = line.isWrapped
+                let isHardContinuation = (line.semanticHardContinuationGroup == activeGroup) ||
+                    line.semanticMarks.contains(where: { $0.group == activeGroup && ($0.kind == .secondary || $0.kind == .continuation) })
+                if isSoftWrapped || isHardContinuation {
+                    stopReason = .rowBudgetExceeded
+                }
+                break
+            }
+
+            let line = buffer.lines[currentRow]
+            if currentRow > inputStartRow {
+                let isSoftWrapped = line.isWrapped
+                let isHardContinuation = (line.semanticHardContinuationGroup == activeGroup) ||
+                    line.semanticMarks.contains(where: { $0.group == activeGroup && ($0.kind == .secondary || $0.kind == .continuation) })
+                if !isSoftWrapped && !isHardContinuation {
+                    stopReason = .fullInputComplete
+                    break
+                }
+            }
+
+            scannedRows += 1
+            if line.hasUncertainAttribution {
+                if currentRow == inputStartRow {
+                    return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                } else {
+                    stopReason = .unknownAttribution
+                    break
+                }
+            }
+            let colStart = (currentRow == anchorPos.row) ? max(0, anchorPos.col) : 0
+            var colLimit = min(cols, min(line.count, maxScanCols))
+
+            // Right prompt filter
+            for m in line.semanticMarks {
+                if m.kind == .right && m.column > colStart {
+                    colLimit = min(colLimit, m.column)
+                }
+            }
+
+            // Stale line filter: older group
+            if line.semanticInputGroup != 0 && line.semanticInputGroup != activeGroup {
+                if currentRow == inputStartRow {
+                    return TerminalInputSnapshot(result: .unavailable(.noInputFound), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                } else {
+                    stopReason = .unknownAttribution
+                    break
+                }
+            }
+
+            // Check if line has missing/mismatched input metadata
+            if line.semanticInputGroup != activeGroup || line.semanticInputColumns.isEmpty {
+                if currentRow > inputStartRow {
+                    if line.hasUncertainAttribution {
+                        stopReason = .unknownAttribution
+                        break
+                    }
+                    let fullLineCols = min(cols, line.count)
+                    if colLimit < fullLineCols {
+                        // Invariant 3: visiting only up to maxScanCols cannot prove unvisited cells empty
+                        stopReason = .columnBudgetExceeded
+                        break
+                    }
+                    var hasUnprovedInput = false
+                    if colStart < colLimit {
+                        for c in colStart..<colLimit {
+                            if line[c].semanticContent == .input {
+                                hasUnprovedInput = true
+                                break
+                            }
+                        }
+                    }
+                    if hasUnprovedInput {
+                        stopReason = .unknownAttribution
+                        break
+                    } else {
+                        // Proven empty continuation line
+                        collectedSegments.append((text: "", isSoftWrapped: line.isWrapped))
+                        currentRow += 1
+                        continue
+                    }
+                } else {
+                    if line.hasUncertainAttribution {
+                        return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                    }
+                    return TerminalInputSnapshot(result: .unavailable(.noInputFound), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                }
+            }
+
+            guard let firstTrustedCol = line.semanticInputColumns.integerGreaterThanOrEqualTo(colStart) else {
+                if currentRow > inputStartRow {
+                    if line.hasUncertainAttribution {
+                        stopReason = .unknownAttribution
+                        break
+                    }
+                    let fullLineCols = min(cols, line.count)
+                    if colLimit < fullLineCols {
+                        stopReason = .columnBudgetExceeded
+                        break
+                    }
+                    var hasUnprovedInput = false
+                    if colStart < colLimit {
+                        for c in colStart..<colLimit {
+                            if line[c].semanticContent == .input {
+                                hasUnprovedInput = true
+                                break
+                            }
+                        }
+                    }
+                    if hasUnprovedInput {
+                        stopReason = .unknownAttribution
+                        break
+                    } else {
+                        collectedSegments.append((text: "", isSoftWrapped: line.isWrapped))
+                        currentRow += 1
+                        continue
+                    }
+                } else {
+                    if line.hasUncertainAttribution {
+                        return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                    }
+                    return TerminalInputSnapshot(result: .unavailable(.noInputFound), scannedRows: scannedRows, scannedCells: totalScannedCells)
+                }
+            }
+
+            if firstTrustedCol >= colLimit {
+                if firstTrustedCol >= maxScanCols {
+                    stopReason = .columnBudgetExceeded
+                } else {
+                    stopReason = .gapEncountered
+                }
+                break
+            }
+
+            var lineChars: [Character] = []
+            var col = firstTrustedCol
+            var rowHadGap = false
+
+            while col < colLimit {
+                guard line.semanticInputColumns.contains(col) else {
+                    if line.semanticInputColumns.integerGreaterThan(col) != nil {
+                        rowHadGap = true
+                    }
+                    break
+                }
+
+                totalScannedCells += 1
+                let cell = line[col]
+                let width = max(1, Int(cell.width))
+                if cell.semanticContent == .input {
+                    if cell.width != 0 {
+                        let ch = getCharacter(for: cell)
+                        lineChars.append(ch)
+                    }
+                } else {
+                    if line.semanticInputColumns.integerGreaterThan(col) != nil {
+                        rowHadGap = true
+                    }
+                    break
+                }
+                col += width
+            }
+
+            let segmentText = String(lineChars)
+            collectedSegments.append((text: segmentText, isSoftWrapped: line.isWrapped))
+
+
+            if rowHadGap {
+                stopReason = .gapEncountered
+                break
+            }
+
+            if line.semanticInputColumns.integerGreaterThanOrEqualTo(maxScanCols) != nil {
+                stopReason = .columnBudgetExceeded
+                break
+            }
+
+            currentRow += 1
+        }
+
+        var logicalLines: [String] = []
+        var currentLogicalLine = ""
+        for (idx, segment) in collectedSegments.enumerated() {
+            if idx > 0 && !segment.isSoftWrapped {
+                logicalLines.append(currentLogicalLine)
+                currentLogicalLine = segment.text
+            } else {
+                currentLogicalLine.append(segment.text)
+            }
+        }
+        if !currentLogicalLine.isEmpty || !logicalLines.isEmpty {
+            logicalLines.append(currentLogicalLine)
+        }
+
+        let rawInput = logicalLines.joined(separator: "\n")
+        let trimmedRaw = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedRaw.isEmpty {
+            if stopReason == .unknownAttribution {
+                return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: scannedRows, scannedCells: totalScannedCells)
+            }
+            return TerminalInputSnapshot(result: .unavailable(.noInputFound), scannedRows: scannedRows, scannedCells: totalScannedCells)
+        }
+
+        let (rawPrefix, rawTruncated) = truncateCharacterPrefix(
+            of: rawInput,
+            maxGraphemes: Int.max,
+            maxUTF8Bytes: 4096
+        )
+
+        let folded = logicalLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        let (summaryText, summaryTruncated) = truncateCharacterPrefix(
+            of: folded.isEmpty ? trimmedRaw : folded,
+            maxGraphemes: 160,
+            maxUTF8Bytes: 1024
+        )
+
+        let isTruncated = rawTruncated || summaryTruncated || (stopReason != .fullInputComplete)
+        let content = TerminalInputContent(
+            summary: summaryText,
+            rawInputPrefix: rawPrefix,
+            isTruncated: isTruncated
+        )
+
+        return TerminalInputSnapshot(
+            result: .success(content),
+            scannedRows: scannedRows,
+            scannedCells: totalScannedCells
+        )
+    }
+
+    /// Public read-only convenience to extract frozen snapshot for an active anchor.
+    public func captureInputSnapshot(anchor: TerminalNavigationAnchor) -> TerminalInputSnapshot {
+        guard let candidate = navigationPromptCandidate, candidate.anchor == anchor else {
+            return TerminalInputSnapshot(result: .unavailable(.invalidAnchor), scannedRows: 0, scannedCells: 0)
+        }
+        guard candidate.runtimeGeneration == self.semanticRuntimeGeneration else {
+            return TerminalInputSnapshot(result: .unavailable(.generationMismatch), scannedRows: 0, scannedCells: 0)
+        }
+        if candidate.hasUncertainReflow || buffer.hasReflowedSinceArmedInput {
+            return TerminalInputSnapshot(result: .unavailable(.ambiguousInput), scannedRows: 0, scannedCells: 0)
+        }
+        return captureInputSnapshotAtC(anchor: anchor, candidate: candidate, runtimeGeneration: semanticRuntimeGeneration)
+    }
+
     private func installNavigationAnchorInvalidationHandler() {
         normalBuffer.navigationAnchorInvalidated = { [weak self] identifier in
             guard let self else { return }
@@ -2009,7 +2402,8 @@ open class Terminal {
     }
 
     private func emitSemanticEvent(_ action: SemanticPromptEventAction,
-                                   localToken: String?, anchor: TerminalNavigationAnchor?) {
+                                   localToken: String?, anchor: TerminalNavigationAnchor?,
+                                   inputSnapshot: TerminalInputSnapshot? = nil) {
         precondition(semanticEventSequence < UInt64.max, "semantic event sequence exhausted")
         semanticEventSequence += 1
         semanticEventObservers.emit(SemanticPromptEvent(
@@ -2017,7 +2411,8 @@ open class Terminal {
             runtimeGeneration: semanticRuntimeGeneration,
             action: action,
             localToken: localToken,
-            anchor: anchor
+            anchor: anchor,
+            inputSnapshot: inputSnapshot
         ))
     }
 
@@ -2058,8 +2453,14 @@ open class Terminal {
         navigationPromptCandidate = NavigationPromptCandidate(
             groupID: groupID,
             anchor: anchor,
-            localPromptToken: allowsTokenOnlyCommandStart ? localToken : nil
+            stage: .prompt,
+            localPromptToken: allowsTokenOnlyCommandStart ? localToken : nil,
+            localPromptTokenConflict: false,
+            allowsTokenOnlyCommandStart: allowsTokenOnlyCommandStart,
+            runtimeGeneration: semanticRuntimeGeneration,
+            hasUncertainReflow: false
         )
+        buffer.hasReflowedSinceArmedInput = false
         return anchor
     }
 
@@ -2712,9 +3113,7 @@ open class Terminal {
                 emitSemanticEvent(.inputStarted, localToken: localToken, anchor: anchor)
             }
         case "C", "D":
-            buffer.semanticContent = .output
-            buffer.semanticInput = .submitted
-            clearEchoedEnterContinuationBeforeOutput()
+            var snapshot: TerminalInputSnapshot? = nil
             // Local P/C markers may omit B; tokenless SSH markers need B/I.
             if action == "C" {
                 if var candidate = navigationPromptCandidate,
@@ -2724,20 +3123,33 @@ open class Terminal {
                     candidate.stage == .prompt &&
                         candidate.localPromptToken != nil &&
                         candidate.localPromptToken == localToken) {
+                    let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
+                    snapshot = captureInputSnapshotAtC(anchor: anchor, candidate: candidate, runtimeGeneration: semanticRuntimeGeneration)
                     candidate.stage = .started
                     navigationPromptCandidate = candidate
-                    let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
-                    emitSemanticEvent(.commandStarted, localToken: localToken, anchor: anchor)
+                    buffer.semanticContent = .output
+                    buffer.semanticInput = .submitted
+                    clearEchoedEnterContinuationBeforeOutput()
+                    emitSemanticEvent(.commandStarted, localToken: localToken, anchor: anchor, inputSnapshot: snapshot)
+                } else {
+                    buffer.semanticContent = .output
+                    buffer.semanticInput = .submitted
+                    clearEchoedEnterContinuationBeforeOutput()
                 }
-            } else if var candidate = navigationPromptCandidate {
-                if candidate.stage == .started {
-                    candidate.stage = .finished
-                    navigationPromptCandidate = candidate
-                    let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
-                    emitSemanticEvent(.commandFinished, localToken: localToken, anchor: anchor)
-                } else if candidate.stage == .prompt || candidate.stage == .input {
-                    candidate.stage = .invalidated
-                    navigationPromptCandidate = candidate
+            } else {
+                buffer.semanticContent = .output
+                buffer.semanticInput = .submitted
+                clearEchoedEnterContinuationBeforeOutput()
+                if var candidate = navigationPromptCandidate {
+                    if candidate.stage == .started {
+                        candidate.stage = .finished
+                        navigationPromptCandidate = candidate
+                        let anchor = resolveNavigationAnchor(candidate.anchor) == nil ? nil : candidate.anchor
+                        emitSemanticEvent(.commandFinished, localToken: localToken, anchor: anchor)
+                    } else if candidate.stage == .prompt || candidate.stage == .input {
+                        candidate.stage = .invalidated
+                        navigationPromptCandidate = candidate
+                    }
                 }
             }
         case "L":
@@ -6967,6 +7379,12 @@ open class Terminal {
             return
         }
         endSynchronizedOutput ()
+        if var candidate = navigationPromptCandidate {
+            if buffer.semanticInput == .armed || candidate.stage == .input || candidate.stage == .prompt {
+                candidate.hasUncertainReflow = true
+                navigationPromptCandidate = candidate
+            }
+        }
         let oldCols = self.cols
         resizeBuffers(newColumns: newCols, newRows: newRows)
         self.cols = newCols

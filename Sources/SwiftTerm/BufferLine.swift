@@ -45,6 +45,119 @@ public final class BufferLine: CustomDebugStringConvertible {
     var semanticHardContinuationGroup: UInt64? = nil {
         didSet { if semanticHardContinuationGroup != oldValue { bump() } }
     }
+    /// Track the exact columns of cells written while armed for a specific prompt group ID (R2).
+    var semanticInputGroup: UInt64 = 0
+    var semanticInputColumns: IndexSet = IndexSet()
+    /// Indicates that this line has suffered an attribution conflict, unsupported copy,
+    /// or uncertain modification that cannot be proven valid for semantic input capture (R4).
+    var hasUncertainAttribution: Bool = false
+
+    func recordInputCellWrite(column: Int, group: UInt64) {
+        guard group != 0 else { return }
+        if semanticInputGroup != group {
+            semanticInputGroup = group
+            semanticInputColumns.removeAll()
+        }
+        semanticInputColumns.insert(column)
+    }
+
+    func shiftInputColumnsForInsert(from pos: Int, by delta: Int, rightMargin: Int) {
+        guard delta > 0, !semanticInputColumns.isEmpty, pos <= rightMargin, rightMargin >= 0, pos >= 0 else { return }
+        let marginSpan = pos ..< (rightMargin + 1)
+        var outside = semanticInputColumns.subtracting(IndexSet(integersIn: marginSpan))
+        let inside = semanticInputColumns.intersection(IndexSet(integersIn: marginSpan))
+        guard !inside.isEmpty else { return }
+
+        for range in inside.rangeView {
+            let start = range.lowerBound + delta
+            let end = range.upperBound + delta
+            if start <= rightMargin {
+                let clampedEnd = min(end, rightMargin + 1)
+                if start < clampedEnd {
+                    outside.insert(integersIn: start ..< clampedEnd)
+                }
+            }
+        }
+        semanticInputColumns = outside
+    }
+
+    func shiftInputColumnsForDelete(from pos: Int, by count: Int, rightMargin: Int) {
+        guard count > 0, !semanticInputColumns.isEmpty, pos <= rightMargin, rightMargin >= 0, pos >= 0 else { return }
+        let marginSpan = pos ..< (rightMargin + 1)
+        var outside = semanticInputColumns.subtracting(IndexSet(integersIn: marginSpan))
+        let inside = semanticInputColumns.intersection(IndexSet(integersIn: marginSpan))
+        guard !inside.isEmpty else { return }
+
+        let survivingStart = pos + count
+        if survivingStart <= rightMargin {
+            let survivingSpan = survivingStart ..< (rightMargin + 1)
+            let surviving = inside.intersection(IndexSet(integersIn: survivingSpan))
+            for range in surviving.rangeView {
+                let start = range.lowerBound - count
+                let end = range.upperBound - count
+                if start < end {
+                    outside.insert(integersIn: start ..< end)
+                }
+            }
+        }
+        semanticInputColumns = outside
+    }
+
+    func clearInputColumns(in range: Range<Int>) {
+        guard !semanticInputColumns.isEmpty else { return }
+        semanticInputColumns.remove(integersIn: range)
+    }
+
+    private func transferInputColumns(from src: BufferLine, srcCol: Int, dstCol: Int, len: Int) {
+        guard len > 0 else { return }
+        let srcSpan = srcCol ..< (srcCol + len)
+        let dstSpan = dstCol ..< (dstCol + len)
+        if src === self {
+            let copied = semanticInputColumns.intersection(IndexSet(integersIn: srcSpan))
+            semanticInputColumns.remove(integersIn: srcSpan)
+            semanticInputColumns.remove(integersIn: dstSpan)
+            for range in copied.rangeView {
+                let shiftedStart = range.lowerBound - srcCol + dstCol
+                let shiftedEnd = range.upperBound - srcCol + dstCol
+                if shiftedStart < shiftedEnd {
+                    semanticInputColumns.insert(integersIn: shiftedStart ..< shiftedEnd)
+                }
+            }
+        } else {
+            semanticInputColumns.remove(integersIn: dstSpan)
+            if src.hasUncertainAttribution {
+                hasUncertainAttribution = true
+            }
+            if src.semanticInputGroup != 0 {
+                let copied = src.semanticInputColumns.intersection(IndexSet(integersIn: srcSpan))
+                if !copied.isEmpty {
+                    if semanticInputGroup == 0 {
+                        semanticInputGroup = src.semanticInputGroup
+                    }
+                    if semanticInputGroup == src.semanticInputGroup {
+                        for range in copied.rangeView {
+                            let shiftedStart = range.lowerBound - srcCol + dstCol
+                            let shiftedEnd = range.upperBound - srcCol + dstCol
+                            if shiftedStart < shiftedEnd {
+                                semanticInputColumns.insert(integersIn: shiftedStart ..< shiftedEnd)
+                            }
+                        }
+                    } else {
+                        // Incompatible groups across lines: destination cannot be proved
+                        hasUncertainAttribution = true
+                        semanticInputGroup = 0
+                        semanticInputColumns.removeAll()
+                    }
+                } else {
+                    hasUncertainAttribution = true
+                }
+            } else {
+                if semanticInputGroup != 0 || !semanticInputColumns.isEmpty {
+                    hasUncertainAttribution = true
+                }
+            }
+        }
+    }
     /// Weak link to the owning buffer, used only so `copyFrom` can ask which
     /// of two colliding same-kind marks is the live origin. Lines that never
     /// carry marks (bare templates) leave this nil.
@@ -91,6 +204,9 @@ public final class BufferLine: CustomDebugStringConvertible {
         renderMode = other.renderMode
         semanticMarks = other.semanticMarks
         semanticHardContinuationGroup = other.semanticHardContinuationGroup
+        semanticInputGroup = other.semanticInputGroup
+        semanticInputColumns = other.semanticInputColumns
+        hasUncertainAttribution = other.hasUncertainAttribution
         // owningBuffer is NOT inherited: a clone is stamped with its real
         // owner when it is attached to a buffer (B.3). Inheriting it from a
         // cross-buffer template leaks the wrong owner.
@@ -161,6 +277,9 @@ public final class BufferLine: CustomDebugStringConvertible {
         let empty = CharData(attribute: attribute)
         data.update(repeating: empty)
         images = nil
+        semanticInputColumns.removeAll()
+        semanticInputGroup = 0
+        hasUncertainAttribution = false
         invalidateAllNavigationAnchors()
         recycleGeneration &+= 1
         bump()
@@ -171,6 +290,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     func destroySemanticState() {
         semanticMarks.removeAll(keepingCapacity: true)
         semanticHardContinuationGroup = nil
+        semanticInputColumns.removeAll()
+        semanticInputGroup = 0
+        hasUncertainAttribution = false
         invalidateAllNavigationAnchors()
     }
     /// Test whether contains any chars.
@@ -211,6 +333,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         }
         marksShift(from: pos, by: n, rightMargin: rightMargin)
         navigationAnchorsShiftForInsert(from: pos, by: n, rightMargin: rightMargin)
+        shiftInputColumnsForInsert(from: pos, by: n, rightMargin: rightMargin)
         bump()
     }
 
@@ -233,6 +356,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         }
         marksShift(from: pos, by: -n, rightMargin: rightMargin)
         navigationAnchorsShiftForDelete(from: pos, by: n, rightMargin: rightMargin)
+        shiftInputColumnsForDelete(from: pos, by: n, rightMargin: rightMargin)
         bump()
     }
 
@@ -356,6 +480,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         let safeStart = min(max(start, 0), length)
         let safeEnd = min(max(end, safeStart), length)
         invalidateNavigationAnchors(in: safeStart..<safeEnd)
+        clearInputColumns(in: safeStart..<safeEnd)
         var idx = start
         while idx < end && idx < length {
             data [idx] = fillData
@@ -426,6 +551,7 @@ public final class BufferLine: CustomDebugStringConvertible {
     public func fill (with: CharData)
     {
         invalidateNavigationAnchors(in: 0..<dataSize)
+        clearInputColumns(in: 0..<dataSize)
         data.update(repeating: with)
         bump()
     }
@@ -440,6 +566,7 @@ public final class BufferLine: CustomDebugStringConvertible {
         let safeStart = min(max(atCol, 0), dataSize)
         let safeEnd = min(max(atCol + len, safeStart), dataSize)
         invalidateNavigationAnchors(in: safeStart..<safeEnd)
+        clearInputColumns(in: safeStart..<safeEnd)
         for i in 0..<len {
             data [i+atCol] = with
         }
@@ -477,6 +604,9 @@ public final class BufferLine: CustomDebugStringConvertible {
         isWrapped = line.isWrapped
         semanticMarks = line.semanticMarks
         semanticHardContinuationGroup = line.semanticHardContinuationGroup
+        semanticInputGroup = line.semanticInputGroup
+        semanticInputColumns = line.semanticInputColumns
+        hasUncertainAttribution = line.hasUncertainAttribution
         bidiState = line.bidiState
         bump()
     }
@@ -519,6 +649,7 @@ public final class BufferLine: CustomDebugStringConvertible {
             }
         }
         transferNavigationAnchors(from: src, srcCol: srcCol, dstCol: dstCol, len: len)
+        transferInputColumns(from: src, srcCol: srcCol, dstCol: dstCol, len: len)
         // Marks travel with their cells. The margin-scroll paths and reflow
         // shuffle cell ranges between line objects through this call, and a
         // mark's row is wherever its cells went: this moves marks, it never
@@ -580,8 +711,14 @@ public final class BufferLine: CustomDebugStringConvertible {
         // narrow-margin copy leaves it (R1: dead clicks over injection).
         if movesSemanticHardContinuation {
             semanticHardContinuationGroup = movedSemanticHardContinuationGroup
+            semanticInputColumns = src.semanticInputColumns
+            semanticInputGroup = src.semanticInputGroup
+            hasUncertainAttribution = src.hasUncertainAttribution
             if src !== self {
                 src.semanticHardContinuationGroup = nil
+                src.semanticInputColumns.removeAll()
+                src.semanticInputGroup = 0
+                src.hasUncertainAttribution = false
             }
         }
         bump()

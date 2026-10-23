@@ -284,6 +284,7 @@ public final class Buffer {
     var semanticContent: SemanticContent = .none
     /// The input lifetime state machine (R4).
     var semanticInput: SemanticInputState = .idle
+    var hasReflowedSinceArmedInput: Bool = false
     var semanticClickMode: SemanticPromptClickMode = .none
     var semanticUsesSpecialCursorKeys = false
 
@@ -424,6 +425,7 @@ public final class Buffer {
 
     func clearSemanticPromptGroup() {
         semanticPromptStartLine = nil
+        hasReflowedSinceArmedInput = false
     }
 
     /// The live origin as (line, kind, column), read directly from the
@@ -1612,6 +1614,9 @@ public final class Buffer {
         if cols == newCols {
             return
         }
+        if semanticInput == .armed {
+            hasReflowedSinceArmedInput = true
+        }
         let navigationIDsBefore = (0..<lines.count).flatMap { row in
             lines[row].navigationAnchors.map(\.identifier)
         }
@@ -1697,6 +1702,9 @@ public final class Buffer {
                     cell.setPayload(atom: payload)
                 }
                 row[_x + i] = cell
+                if semanticInput == .armed && semanticContent == .input {
+                    row.recordInputCellWrite(column: _x + i, group: activeSemanticGroupID)
+                }
             }
             _x += runLen
             consumed += runLen
@@ -1769,6 +1777,9 @@ public final class Buffer {
         }
         charData.setPayload(atom: resolvePayload() ?? TinyAtom.empty)
         bufferRow[_x] = charData
+        if semanticInput == .armed && semanticContent == .input {
+            bufferRow.recordInputCellWrite(column: _x, group: activeSemanticGroupID)
+        }
         _x += 1
 
         // fullwidth char - also set next cell to placeholder stub and advance cursor
@@ -1781,6 +1792,9 @@ public final class Buffer {
             chWidth -= 1
             while chWidth != 0 && _x < _cols {
                 bufferRow [_x] = wideEmpty
+                if semanticInput == .armed && semanticContent == .input {
+                    bufferRow.recordInputCellWrite(column: _x, group: activeSemanticGroupID)
+                }
                 _x += 1
                 chWidth -= 1
             }

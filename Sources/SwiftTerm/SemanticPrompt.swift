@@ -110,6 +110,46 @@ public struct TerminalNavigationAnchor: Hashable, Sendable {
     }
 }
 
+/// An immutable snapshot of the shell input captured synchronously at OSC 133 C moment.
+public struct TerminalInputSnapshot: Sendable, Equatable {
+    public let result: TerminalInputSnapshotResult
+    public let scannedRows: Int
+    public let scannedCells: Int
+
+    public init(result: TerminalInputSnapshotResult, scannedRows: Int, scannedCells: Int) {
+        self.result = result
+        self.scannedRows = scannedRows
+        self.scannedCells = scannedCells
+    }
+}
+
+public enum TerminalInputSnapshotResult: Sendable, Equatable {
+    case success(TerminalInputContent)
+    case unavailable(TerminalInputUnavailableReason)
+}
+
+public struct TerminalInputContent: Sendable, Equatable {
+    public let summary: String
+    public let rawInputPrefix: String
+    public let isTruncated: Bool
+
+    public init(summary: String, rawInputPrefix: String, isTruncated: Bool) {
+        self.summary = summary
+        self.rawInputPrefix = rawInputPrefix
+        self.isTruncated = isTruncated
+    }
+}
+
+public enum TerminalInputUnavailableReason: String, Sendable, Equatable {
+    case invalidAnchor
+    case generationMismatch
+    case noInputFound
+    case ambiguousInput
+    case exceededPromptSeekBudget
+    case exceededScanRowBudget
+    case promptGroupAmbiguity
+}
+
 /// A parser-ordered semantic event emitted after a complete, valid OSC 133
 /// sequence has updated the terminal's existing semantic prompt state.
 public enum SemanticPromptEventAction: Equatable, Sendable {
@@ -133,15 +173,19 @@ public struct SemanticPromptEvent: Sendable {
     public let localToken: String?
     /// The prompt origin associated with this transition, if it still exists.
     public let anchor: TerminalNavigationAnchor?
+    /// Synchronously frozen input snapshot for .commandStarted actions.
+    public let inputSnapshot: TerminalInputSnapshot?
 
     init(sequence: UInt64, runtimeGeneration: SemanticRuntimeGeneration,
          action: SemanticPromptEventAction, localToken: String?,
-         anchor: TerminalNavigationAnchor?) {
+         anchor: TerminalNavigationAnchor?,
+         inputSnapshot: TerminalInputSnapshot? = nil) {
         self.sequence = sequence
         self.runtimeGeneration = runtimeGeneration
         self.action = action
         self.localToken = localToken
         self.anchor = anchor
+        self.inputSnapshot = inputSnapshot
     }
 }
 
