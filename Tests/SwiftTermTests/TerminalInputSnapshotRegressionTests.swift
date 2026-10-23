@@ -155,6 +155,71 @@ struct TerminalInputSnapshotRegressionTests {
         }
     }
 
+    @Test("B3: 27 PS2 input lines exhaust the 25-row scan budget")
+    func rowScanBudgetTruncatesTwentySevenPS2Lines() throws {
+        let (terminal, _) = makeTerminal(rows: 40)
+        var snapshot: TerminalInputSnapshot?
+        let observation = terminal.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        defer { observation.cancel() }
+
+        osc("A", on: terminal)
+        terminal.feed(text: "$ ")
+        osc("B", on: terminal)
+        terminal.feed(text: "x")
+        for _ in 1..<27 {
+            terminal.feed(text: "\r\n")
+            osc("P;k=s", on: terminal)
+            terminal.feed(text: "> ")
+            osc("B", on: terminal)
+            terminal.feed(text: "x")
+        }
+        osc("C", on: terminal)
+
+        let captured = try #require(snapshot, "B3 must produce a C-event snapshot")
+        switch captured.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == Array(repeating: "x", count: 25).joined(separator: "\n"))
+            #expect(content.isTruncated == true)
+        case .unavailable(let reason):
+            Issue.record("B3 must capture the trusted 25-line prefix: \(reason)")
+        }
+    }
+
+    @Test("B4: continuous input stops at column 512 without joining later soft wraps")
+    func continuousInputColumnBudgetKeepsOnlyTrustedPrefix() throws {
+        let (terminal, _) = makeTerminal(cols: 600, rows: 40)
+        var snapshot: TerminalInputSnapshot?
+        let observation = terminal.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        defer { observation.cancel() }
+
+        let expectedPrefix = String(repeating: "a", count: 112)
+        let input = expectedPrefix + String(repeating: "b", count: 88)
+            + String(repeating: "c", count: 100) + String(repeating: "d", count: 50)
+        osc("A", on: terminal)
+        terminal.feed(text: String(repeating: "p", count: 400))
+        osc("B", on: terminal)
+        terminal.feed(text: input)
+        osc("C", on: terminal)
+
+        let captured = try #require(snapshot, "B4 must produce a C-event snapshot")
+        switch captured.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == expectedPrefix)
+            #expect(content.summary == expectedPrefix)
+            #expect(content.isTruncated == true)
+        case .unavailable(let reason):
+            Issue.record("B4 must capture exactly the first 112 input columns: \(reason)")
+        }
+    }
+
     @Test("7. Budget boundaries, truncation flag, row/col cutoff, and grapheme integrity (M1/M2/N4)")
     func budgetBoundariesAndTruncation() {
         // M2: Current row input ends exactly at col 512, followed by PS2 continuation
