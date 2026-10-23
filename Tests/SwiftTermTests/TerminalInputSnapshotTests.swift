@@ -62,7 +62,7 @@ struct TerminalInputSnapshotTests {
         observation.cancel()
     }
 
-    @Test("2. Q1 prompt seek and Q2 command span boundaries")
+    @Test("2. Q1 prompt seek and Q2 command span boundaries (S2A/S2B)")
     func promptSeekAndCommandSpanBoundaries() {
         let (terminal, _) = makeTerminal()
         var snapshot: TerminalInputSnapshot?
@@ -111,10 +111,91 @@ struct TerminalInputSnapshotTests {
         case .success:
             Issue.record("Expected noInputFound for empty command input")
         }
+
+        // S2A: Q1 short overwrite of stale tail isolates new input without stale residue
+        snapshot = nil
+        terminal.feed(text: "\r\n")
+        osc("D;0", on: terminal)
+        let (termS2A, _) = makeTerminal()
+        let obsS2A = termS2A.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        osc("A", on: termS2A)
+        termS2A.feed(text: "$ ")
+        osc("B", on: termS2A)
+        termS2A.feed(text: "oldcommand")
+        osc("C", on: termS2A)
+        osc("D;0", on: termS2A)
+        // Reposition cursor to row 1 col 1, write new prompt and short input "new", submit with C
+        termS2A.feed(text: "\u{1b}[1;1H")
+        osc("A", on: termS2A)
+        termS2A.feed(text: "$ ")
+        osc("B", on: termS2A)
+        termS2A.feed(text: "new")
+        osc("C", on: termS2A)
+
+        guard let s2a = snapshot else {
+            Issue.record("Expected snapshot for S2A")
+            return
+        }
+        switch s2a.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == "new")
+            #expect(content.summary == "new")
+            #expect(!content.summary.contains("command"))
+            #expect(!content.isTruncated)
+        case .unavailable(let reason):
+            Issue.record("Unexpected unavailable for S2A: \(reason)")
+        }
+        obsS2A.cancel()
+
+        // S2B: Q2 Continuation residue from previous multiline command filtered
+        snapshot = nil
+        let (termS2B, _) = makeTerminal()
+        let obsS2B = termS2B.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        osc("A", on: termS2B)
+        termS2B.feed(text: "$ ")
+        osc("B", on: termS2B)
+        termS2B.feed(text: "multiline-cmd\r\n")
+        osc("P;k=s", on: termS2B)
+        termS2B.feed(text: "> ")
+        osc("B", on: termS2B)
+        termS2B.feed(text: "line2")
+        osc("C", on: termS2B)
+        osc("D;0", on: termS2B)
+        // Reposition cursor to row 1 col 1, write single line command "new"
+        termS2B.feed(text: "\u{1b}[1;1H")
+        osc("A", on: termS2B)
+        termS2B.feed(text: "$ ")
+        osc("B", on: termS2B)
+        termS2B.feed(text: "new")
+        osc("C", on: termS2B)
+
+        guard let s2b = snapshot else {
+            Issue.record("Expected snapshot for S2B")
+            return
+        }
+        switch s2b.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == "new")
+            #expect(content.summary == "new")
+            #expect(!content.summary.contains("line2"))
+            #expect(!content.isTruncated)
+        case .unavailable(let reason):
+            Issue.record("Unexpected unavailable for S2B: \(reason)")
+        }
+        obsS2B.cancel()
+
         observation.cancel()
     }
 
-    @Test("3. Normal, wide (CJK), and combining character handling")
+    @Test("3. Normal, wide (CJK), combining character, and multi-byte emoji handling")
     func normalWideAndCombiningCharacters() {
         let (terminal, _) = makeTerminal(cols: 80, rows: 24)
         var snapshot: TerminalInputSnapshot?
@@ -124,7 +205,7 @@ struct TerminalInputSnapshotTests {
             }
         }
 
-        // CJK wide characters + combining accent
+        // CJK wide characters + combining accent sequence
         let combiningText = "e\u{0301}" // é as combining sequence
         let wideText = "测试输入"
         let mixedCommand = "echo \(wideText) \(combiningText) done"
@@ -141,16 +222,105 @@ struct TerminalInputSnapshotTests {
         }
         switch s.result {
         case .success(let content):
+            #expect(content.rawInputPrefix == mixedCommand)
+            #expect(content.summary == mixedCommand)
             #expect(content.rawInputPrefix.contains(wideText))
+            #expect(content.rawInputPrefix.contains(combiningText))
             #expect(content.rawInputPrefix.contains("done"))
             #expect(!content.isTruncated)
         case .unavailable(let reason):
             Issue.record("Unexpected unavailable for wide/combining input: \(reason)")
         }
+
+        // S5B: Combining family emoji preserved as atomic grapheme cluster
+        snapshot = nil
+        terminal.feed(text: "\r\n")
+        osc("D;0", on: terminal)
+        let familyEmoji = "👨‍👩‍👧‍👦"
+        let familyCmd = "echo \(familyEmoji)"
+        osc("A", on: terminal)
+        terminal.feed(text: "$ ")
+        osc("B", on: terminal)
+        terminal.feed(text: familyCmd)
+        osc("C", on: terminal)
+
+        guard let s5b = snapshot else {
+            Issue.record("Expected snapshot for family emoji")
+            return
+        }
+        switch s5b.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == familyCmd)
+            #expect(content.summary == familyCmd)
+            #expect(!content.isTruncated)
+        case .unavailable(let reason):
+            Issue.record("Unexpected unavailable for family emoji: \(reason)")
+        }
+
+        // S5D: Legitimate literal U+FFFD preserved without error
+        snapshot = nil
+        terminal.feed(text: "\r\n")
+        osc("D;0", on: terminal)
+        let fffdCmd = "echo \"literal_\u{FFFD}_char\""
+        osc("A", on: terminal)
+        terminal.feed(text: "$ ")
+        osc("B", on: terminal)
+        terminal.feed(text: fffdCmd)
+        osc("C", on: terminal)
+
+        guard let s5d = snapshot else {
+            Issue.record("Expected snapshot for literal U+FFFD")
+            return
+        }
+        switch s5d.result {
+        case .success(let content):
+            #expect(content.rawInputPrefix == fffdCmd)
+            #expect(content.summary == fffdCmd)
+            #expect(!content.isTruncated)
+        case .unavailable(let reason):
+            Issue.record("Unexpected unavailable for literal U+FFFD: \(reason)")
+        }
+
+        // S5C: Dual-budget multi-byte emoji stream truncated strictly on Character boundary
+        snapshot = nil
+        terminal.feed(text: "\r\n")
+        osc("D;0", on: terminal)
+        let (wideTerm, _) = makeTerminal(cols: 500, rows: 40)
+        let wideObs = wideTerm.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        let hugeEmojiInput = "x" + String(repeating: familyEmoji, count: 200)
+        osc("A", on: wideTerm)
+        wideTerm.feed(text: "$ ")
+        osc("B", on: wideTerm)
+        wideTerm.feed(text: hugeEmojiInput)
+        osc("C", on: wideTerm)
+
+        guard let s5c = snapshot else {
+            Issue.record("Expected snapshot for long emoji stream")
+            return
+        }
+        switch s5c.result {
+        case .success(let content):
+            #expect(content.isTruncated == true)
+            #expect(content.rawInputPrefix.utf8.count <= 4096)
+            #expect(content.summary.utf8.count <= 1024)
+            #expect(content.summary.count <= 160)
+            #expect(!content.rawInputPrefix.contains("\u{FFFD}"))
+            #expect(!content.summary.contains("\u{FFFD}"))
+            #expect(!content.rawInputPrefix.isEmpty)
+            #expect(hugeEmojiInput.hasPrefix(content.rawInputPrefix))
+        case .unavailable(let reason):
+            Issue.record("Unexpected unavailable for long emoji stream: \(reason)")
+        }
+        wideObs.cancel()
+
         observation.cancel()
     }
 
-    @Test("4. Soft wrap and secondary PS2 continuation lines")
+    @Test("4. Soft wrap and secondary PS2 continuation lines (S3B)")
     func softWrapAndSecondaryContinuation() {
         let (terminal, _) = makeTerminal(cols: 16, rows: 10)
         var snapshot: TerminalInputSnapshot?
@@ -174,12 +344,13 @@ struct TerminalInputSnapshotTests {
         switch s1.result {
         case .success(let content):
             #expect(content.rawInputPrefix == "abcdefghijklmnopqrstuvwxyz1234")
+            #expect(content.summary == "abcdefghijklmnopqrstuvwxyz1234")
             #expect(!content.isTruncated)
         case .unavailable(let reason):
             Issue.record("Unexpected unavailable for soft wrap: \(reason)")
         }
 
-        // Secondary prompt continuation (PS2) with multiple lines
+        // S3B: Secondary prompt continuation (PS2) with empty lines preserved in raw and folded in summary
         snapshot = nil
         terminal.feed(text: "\r\n")
         osc("D;0", on: terminal)
@@ -193,21 +364,28 @@ struct TerminalInputSnapshotTests {
         osc("A", on: wideTerminal)
         wideTerminal.feed(text: "$ ")
         osc("B", on: wideTerminal)
-        wideTerminal.feed(text: "first line \\\r\n")
+        wideTerminal.feed(text: "def foo():\r\n")
         osc("P;k=s", on: wideTerminal)
         wideTerminal.feed(text: "> ")
         osc("B", on: wideTerminal)
-        wideTerminal.feed(text: "second line")
+        wideTerminal.feed(text: "\r\n")
+        osc("P;k=s", on: wideTerminal)
+        wideTerminal.feed(text: "> ")
+        osc("B", on: wideTerminal)
+        wideTerminal.feed(text: "    return 42")
         osc("C", on: wideTerminal)
 
         guard let s2 = snapshot else {
             Issue.record("Expected snapshot for PS2 continuation")
             return
         }
+        let expectedRaw = "def foo():\n\n    return 42"
+        let expectedSummary = "def foo(): return 42"
         switch s2.result {
         case .success(let content):
-            #expect(content.rawInputPrefix.contains("first line"))
-            #expect(content.rawInputPrefix.contains("second line"))
+            #expect(content.rawInputPrefix == expectedRaw)
+            #expect(content.summary == expectedSummary)
+            #expect(!content.isTruncated)
         case .unavailable(let reason):
             Issue.record("Unexpected unavailable for PS2 continuation: \(reason)")
         }
@@ -215,7 +393,7 @@ struct TerminalInputSnapshotTests {
         observation.cancel()
     }
 
-    @Test("5. Anchor identity, reflow preservation, and runtime generation mismatch")
+    @Test("5. Anchor identity, reflow preservation, and runtime generation mismatch (N1a/N1b/B6)")
     func anchorIdentityAndGenerationMismatch() {
         let (terminal, _) = makeTerminal(cols: 40, rows: 10)
         var lastAnchor: TerminalNavigationAnchor?
@@ -252,11 +430,121 @@ struct TerminalInputSnapshotTests {
         case .success:
             Issue.record("Expected ambiguousInput after reflow since armed input")
         }
-
-        // New runtime generation isolates previous anchors
-        terminal.beginSemanticRuntime(SemanticRuntimeGeneration(rawValue: 2), preservingExistingAnchors: false)
-        #expect(terminal.resolveNavigationAnchor(lastAnchor!) == nil)
-
         observation.cancel()
+
+        // N1a: Same-generation normal buffer reset triggers navigationAnchorInvalidated
+        do {
+            let (termN1a, _) = makeTerminal(cols: 80, rows: 24)
+            var originalAnchor: TerminalNavigationAnchor?
+            var invalidatedAnchors: [TerminalNavigationAnchor] = []
+            let obsN1a = termN1a.observeSemanticEvents { e in
+                if e.action == .commandStarted {
+                    originalAnchor = e.anchor
+                }
+                if e.action == .navigationAnchorInvalidated, let a = e.anchor {
+                    invalidatedAnchors.append(a)
+                }
+            }
+            osc("A", on: termN1a)
+            termN1a.feed(text: "$ ")
+            osc("B", on: termN1a)
+            termN1a.feed(text: "echo x")
+            osc("C", on: termN1a)
+            osc("D;0", on: termN1a)
+
+            #expect(originalAnchor != nil)
+            #expect(termN1a.resolveNavigationAnchor(originalAnchor!) != nil)
+
+            termN1a.resetNormalBuffer()
+            obsN1a.cancel()
+
+            #expect(invalidatedAnchors.count == 1)
+            if let orig = originalAnchor, let inval = invalidatedAnchors.first {
+                #expect(inval == orig)
+                #expect(Set([orig]).subtracting(Set(invalidatedAnchors)).isEmpty)
+                #expect(termN1a.resolveNavigationAnchor(orig) == nil)
+            }
+        }
+
+        // N1b: Generation change without anchor preservation triggers navigationAnchorInvalidated
+        do {
+            let (termN1b, _) = makeTerminal(cols: 80, rows: 24)
+            var originalAnchor: TerminalNavigationAnchor?
+            var invalidatedAnchors: [TerminalNavigationAnchor] = []
+            let obsN1b = termN1b.observeSemanticEvents { e in
+                if e.action == .commandStarted {
+                    originalAnchor = e.anchor
+                }
+                if e.action == .navigationAnchorInvalidated, let a = e.anchor {
+                    invalidatedAnchors.append(a)
+                }
+            }
+            osc("A", on: termN1b)
+            termN1b.feed(text: "$ ")
+            osc("B", on: termN1b)
+            termN1b.feed(text: "echo x")
+            osc("C", on: termN1b)
+            osc("D;0", on: termN1b)
+
+            #expect(originalAnchor != nil)
+            #expect(termN1b.resolveNavigationAnchor(originalAnchor!) != nil)
+
+            termN1b.beginSemanticRuntime(SemanticRuntimeGeneration(rawValue: 2), preservingExistingAnchors: false)
+            obsN1b.cancel()
+
+            #expect(invalidatedAnchors.count == 1)
+            if let orig = originalAnchor, let inval = invalidatedAnchors.first {
+                #expect(inval == orig)
+                #expect(Set([orig]).subtracting(Set(invalidatedAnchors)).isEmpty)
+                #expect(termN1b.resolveNavigationAnchor(orig) == nil)
+            }
+        }
+
+        // B6: Preserved old navigation anchor from previous generation rejected for active capture but remains valid for navigation
+        do {
+            let (termB6, _) = makeTerminal(cols: 80, rows: 24)
+            let g1 = SemanticRuntimeGeneration(rawValue: 1)
+            let g2 = SemanticRuntimeGeneration(rawValue: 2)
+            termB6.beginSemanticRuntime(g1, preservingExistingAnchors: false)
+            var oldAnchor: TerminalNavigationAnchor?
+            let obsB6 = termB6.observeSemanticEvents { e in
+                if e.action == .commandStarted {
+                    oldAnchor = e.anchor
+                }
+            }
+            osc("A", on: termB6)
+            termB6.feed(text: "$ ")
+            osc("B", on: termB6)
+            termB6.feed(text: "old-runtime-command")
+            osc("C", on: termB6)
+            osc("D;0", on: termB6)
+            termB6.feed(text: "\r\n")
+            obsB6.cancel()
+
+            #expect(oldAnchor != nil)
+            #expect(termB6.resolveNavigationAnchor(oldAnchor!) != nil)
+
+            // Switch generation while preserving existing anchors for navigation
+            termB6.beginSemanticRuntime(g2, preservingExistingAnchors: true)
+            osc("A", on: termB6)
+            termB6.feed(text: "$ ")
+            osc("B", on: termB6)
+            termB6.feed(text: "new-runtime-input")
+
+            // Active capture using the old anchor must be explicitly rejected
+            let oldSnapshot = oldAnchor.map { termB6.captureInputSnapshot(anchor: $0) }
+            #expect(oldSnapshot != nil)
+            if let snap = oldSnapshot {
+                switch snap.result {
+                case .unavailable:
+                    #expect(true)
+                case .success:
+                    Issue.record("Preserved old anchor must be rejected for active capture")
+                }
+            }
+
+            // Old anchor remains resolvable for navigation
+            #expect(termB6.resolveNavigationAnchor(oldAnchor!) != nil)
+        }
     }
 }

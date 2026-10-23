@@ -16,104 +16,354 @@ struct TerminalInputSnapshotRegressionTests {
         terminal.feed(text: "\u{1b}]133;\(action)\u{07}")
     }
 
-    @Test("6. ICH, DCH, and in-line cursor editing")
+    @Test("6. ICH, DCH, in-line editing, and margin preservation (N2a/N2b/N2d/M3)")
     func insertAndDeleteCharacterEditing() {
-        let (terminal, _) = makeTerminal()
-        var snapshot: TerminalInputSnapshot?
-        let observation = terminal.observeSemanticEvents { event in
-            if event.action == .commandStarted {
-                snapshot = event.inputSnapshot
+        // N2a: ICH with replacement: inserting characters shifts existing input and captures accurately
+        do {
+            let (terminal, _) = makeTerminal()
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
             }
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "abcdef")
+            // Move cursor to row 1 col 5 (over 'c'), insert 2 characters (ICH), write "XY"
+            terminal.feed(text: "\u{1b}[1;5H\u{1b}[2@XY")
+            osc("C", on: terminal)
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for N2a")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == "abXYcdef")
+                #expect(content.summary == "abXYcdef")
+                #expect(!content.isTruncated)
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for N2a ICH: \(reason)")
+            }
+            observation.cancel()
         }
 
-        osc("A", on: terminal)
-        terminal.feed(text: "$ ")
-        osc("B", on: terminal)
-        terminal.feed(text: "ABCD")
+        // N2b: DCH shifts historical stale tail, new command isolates without stale tail
+        do {
+            let (terminal, _) = makeTerminal()
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "abcdefghij")
+            osc("C", on: terminal)
+            osc("D;0", on: terminal)
+            // Move to row 1 col 1, write new command "xyz", delete 1 character at position 3
+            terminal.feed(text: "\u{1b}[1;1H")
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "xyz")
+            terminal.feed(text: "\u{1b}[1;3H\u{1b}[1P")
+            osc("C", on: terminal)
 
-        // Move cursor back 2 columns (over 'C')
-        terminal.feed(text: "\u{1b}[2D")
-        // Delete 1 character (DCH) -> "ABD"
-        terminal.feed(text: "\u{1b}[1P")
-        // Move to end and append "E"
-        terminal.feed(text: "\u{1b}[1C" + "E")
-        osc("C", on: terminal)
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for N2b")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == "yz")
+                #expect(content.summary == "yz")
+                #expect(!content.isTruncated)
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for N2b DCH: \(reason)")
+            }
+            observation.cancel()
+        }
 
-        guard let s = snapshot else {
-            Issue.record("Expected snapshot")
-            return
+        // N2d: Simple DCH with no historical tail
+        do {
+            let (terminal, _) = makeTerminal()
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "abcdef")
+            // Move to col 5 and delete 2 chars (DCH) -> "abef"
+            terminal.feed(text: "\u{1b}[1;5H\u{1b}[2P")
+            osc("C", on: terminal)
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for N2d")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == "abef")
+                #expect(content.summary == "abef")
+                #expect(!content.isTruncated)
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for N2d DCH: \(reason)")
+            }
+            observation.cancel()
         }
-        switch s.result {
-        case .success(let content):
-            #expect(content.rawInputPrefix == "ABDE")
-            #expect(!content.isTruncated)
-        case .unavailable(let reason):
-            Issue.record("Unexpected unavailable for DCH edit: \(reason)")
+
+        // M3: Horizontal margin DCH does not crash, preserves text outside margin, and produces conservative snapshot
+        do {
+            let (terminal, _) = makeTerminal(cols: 80, rows: 24)
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+            // ab in prompt, xyz at col 71, set margins 1;20, delete character at col 3
+            let marginStream = "\u{1b}]133;A\u{07}$ \u{1b}]133;B\u{07}ab\u{1b}[1;71Hxyz\u{1b}[?69h\u{1b}[1;20s\u{1b}[1;3H\u{1b}[1P"
+            terminal.feed(text: marginStream)
+            osc("C", on: terminal)
+
+            // Text outside margin (cols 70..<73) must remain "xyz"
+            let outside = (70..<73).map { terminal.getCharacter(col: $0, row: 0).map(String.init) ?? "?" }.joined()
+            #expect(outside == "xyz")
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for M3 margin DCH")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == "b")
+                #expect(content.isTruncated == true)
+            case .unavailable(let reason):
+                // Conservative safety is also acceptable if margin manipulation marks ambiguous
+                #expect(reason == .ambiguousInput)
+            }
+            observation.cancel()
         }
-        observation.cancel()
     }
 
-    @Test("7. Budget boundaries, truncation flag, and grapheme cluster integrity")
+    @Test("7. Budget boundaries, truncation flag, row/col cutoff, and grapheme integrity (M1/M2/N4)")
     func budgetBoundariesAndTruncation() {
-        let (terminal, _) = makeTerminal(cols: 500, rows: 40)
-        var snapshot: TerminalInputSnapshot?
-        let observation = terminal.observeSemanticEvents { event in
-            if event.action == .commandStarted {
-                snapshot = event.inputSnapshot
+        // M2: Current row input ends exactly at col 512, followed by PS2 continuation
+        do {
+            let (terminal, _) = makeTerminal(cols: 600, rows: 40)
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
             }
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "a" + String(repeating: " ", count: 509) + "\r\n")
+            osc("P;k=s", on: terminal)
+            terminal.feed(text: "> ")
+            osc("B", on: terminal)
+            terminal.feed(text: "tail")
+            osc("C", on: terminal)
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for M2")
+                return
+            }
+            let expectedRaw = "a" + String(repeating: " ", count: 509) + "\ntail"
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == expectedRaw)
+                #expect(!content.isTruncated)
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for M2: \(reason)")
+            }
+            observation.cancel()
         }
 
-        // Generate input longer than raw budget (> 4096 bytes)
-        let hugeToken = String(repeating: "abcdefghij", count: 450) // 4500 chars
+        // N4: Trailing spaces / collection cutoff completeness proves byte and summary budgets cannot substitute
+        do {
+            let (terminal, _) = makeTerminal(cols: 80, rows: 40)
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+            let input = "echo" + String(repeating: " ", count: 500) + "tail"
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: input)
+            osc("C", on: terminal)
 
-        osc("A", on: terminal)
-        terminal.feed(text: "$ ")
-        osc("B", on: terminal)
-        terminal.feed(text: hugeToken)
-        osc("C", on: terminal)
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for N4")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == input)
+                #expect(content.summary.count <= 160)
+                #expect(content.isTruncated == true)
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for N4: \(reason)")
+            }
+            observation.cancel()
+        }
 
-        guard let s = snapshot else {
-            Issue.record("Expected snapshot")
-            return
+        // M1: Column cutoff beyond column budget stops before gap
+        do {
+            let (terminal, _) = makeTerminal(cols: 600, rows: 40)
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: "a\u{1b}[1;551H" + String(repeating: "x", count: 50) + "TAIL")
+            osc("C", on: terminal)
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot for M1")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.rawInputPrefix == "a")
+                #expect(content.isTruncated == true)
+            case .unavailable(let reason):
+                #expect(reason == .ambiguousInput)
+            }
+            observation.cancel()
         }
-        switch s.result {
-        case .success(let content):
-            #expect(content.isTruncated == true)
-            #expect(content.rawInputPrefix.utf8.count <= 4096)
-            #expect(content.summary.utf8.count <= 1024)
-            #expect(content.summary.count <= 160)
-            #expect(hugeToken.hasPrefix(content.rawInputPrefix))
-        case .unavailable(let reason):
-            Issue.record("Unexpected unavailable for long command: \(reason)")
+
+        // Massive ASCII stream (4500 chars) exceeding raw budget (>4096B)
+        do {
+            let (terminal, _) = makeTerminal(cols: 500, rows: 40)
+            var snapshot: TerminalInputSnapshot?
+            let observation = terminal.observeSemanticEvents { event in
+                if event.action == .commandStarted {
+                    snapshot = event.inputSnapshot
+                }
+            }
+
+            let hugeToken = String(repeating: "abcdefghij", count: 450) // 4500 chars
+            osc("A", on: terminal)
+            terminal.feed(text: "$ ")
+            osc("B", on: terminal)
+            terminal.feed(text: hugeToken)
+            osc("C", on: terminal)
+
+            guard let s = snapshot else {
+                Issue.record("Expected snapshot")
+                return
+            }
+            switch s.result {
+            case .success(let content):
+                #expect(content.isTruncated == true)
+                #expect(content.rawInputPrefix.utf8.count <= 4096)
+                #expect(content.summary.utf8.count <= 1024)
+                #expect(content.summary.count <= 160)
+                #expect(hugeToken.hasPrefix(content.rawInputPrefix))
+            case .unavailable(let reason):
+                Issue.record("Unexpected unavailable for long command: \(reason)")
+            }
+            observation.cancel()
         }
-        observation.cancel()
     }
 
-    @Test("8. Unknown attribution preservation across line copy and clone")
+    @Test("8. Unknown attribution preservation across line copy, clone, partial write, and erasures")
     func unknownAttributionPreservation() {
         let (terminal, _) = makeTerminal()
+        // Setup historical command 1
         osc("A", on: terminal)
         terminal.feed(text: "$ ")
         osc("B", on: terminal)
-        terminal.feed(text: "target line")
+        terminal.feed(text: "OLDZZ")
+        osc("C", on: terminal)
+        osc("D;0", on: terminal)
+        terminal.feed(text: "\r\n")
 
-        guard let targetLine = terminal.bufferLine(atRow: 0) else {
-            Issue.record("Missing target buffer line")
+        // Setup multiline command 2
+        osc("A", on: terminal)
+        terminal.feed(text: "$ ")
+        osc("B", on: terminal)
+        terminal.feed(text: "first\r\n")
+        osc("P;k=s", on: terminal)
+        terminal.feed(text: "> ")
+        osc("B", on: terminal)
+        terminal.feed(text: "second\r\n")
+        osc("P;k=s", on: terminal)
+        terminal.feed(text: "> ")
+        osc("B", on: terminal)
+        terminal.feed(text: "third")
+
+        // Inject cross-group conflict: copy from row 0 to continuation row 2
+        guard let old = terminal.bufferLine(atRow: 0), let cont = terminal.bufferLine(atRow: 2) else {
+            Issue.record("Missing buffer rows")
             return
         }
-        #expect(!targetLine.hasUncertainAttribution)
+        #expect(!cont.hasUncertainAttribution)
+        cont.copyFrom(old, srcCol: 2, dstCol: 10, len: 4)
+        #expect(cont.hasUncertainAttribution)
 
-        // Mark line with uncertain attribution
-        targetLine.hasUncertainAttribution = true
-        #expect(targetLine.hasUncertainAttribution)
+        // BufferLine(from:) clone constructor must propagate hasUncertainAttribution
+        let cloned = BufferLine(from: cont)
+        #expect(cloned.hasUncertainAttribution)
+        cont.copyFrom(line: cloned)
+        #expect(cont.hasUncertainAttribution)
 
-        // Clone/copy line
-        guard let destLine = terminal.bufferLine(atRow: 1) else {
-            Issue.record("Missing dest buffer line")
+        // Partial write does not clear unknown attribution
+        terminal.feed(text: "\u{1b}[3;3HW")
+        #expect(cont.hasUncertainAttribution)
+
+        // Local erase (ECH) does not clear unknown attribution
+        terminal.feed(text: "\u{1b}[3;3H\u{1b}[1X")
+        #expect(cont.hasUncertainAttribution)
+
+        // ICH does not clear unknown attribution
+        terminal.feed(text: "\u{1b}[3;3H\u{1b}[1@")
+        #expect(cont.hasUncertainAttribution)
+
+        // DCH does not clear unknown attribution
+        terminal.feed(text: "\u{1b}[3;3H\u{1b}[1P")
+        #expect(cont.hasUncertainAttribution)
+
+        // C snapshot proves that reading stops before the uncertain line
+        var snapshot: TerminalInputSnapshot?
+        let observation = terminal.observeSemanticEvents { event in
+            if event.action == .commandStarted {
+                snapshot = event.inputSnapshot
+            }
+        }
+        osc("C", on: terminal)
+        observation.cancel()
+
+        guard let s = snapshot else {
+            Issue.record("Expected snapshot after unknown line barrier")
             return
         }
-        destLine.copyFrom(targetLine, srcCol: 0, dstCol: 0, len: targetLine.count)
-        #expect(destLine.hasUncertainAttribution)
+        switch s.result {
+        case .success(let content):
+            #expect(!content.rawInputPrefix.contains("third"))
+            #expect(content.isTruncated == true)
+        case .unavailable:
+            #expect(true)
+        }
     }
 
     @Test("9. Unknown line pre-read barrier stops before reading uncertain line")
@@ -137,7 +387,6 @@ struct TerminalInputSnapshotRegressionTests {
             return
         }
         line0.hasUncertainAttribution = true
-
         osc("C", on: terminal)
 
         guard let s = snapshot else {
